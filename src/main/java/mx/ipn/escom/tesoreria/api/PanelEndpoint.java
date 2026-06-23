@@ -7,7 +7,9 @@ import java.net.http.HttpResponse;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 
 import com.google.gson.Gson;
 import com.google.gson.JsonObject;
@@ -46,6 +48,13 @@ public final class PanelEndpoint implements Endpoint {
 
     /** Node configuration providing the peer list (TES_PEERS). */
     private final NodeConfig config;
+
+    /**
+     * Last node id each peer reported while it was up, keyed by base URL. A
+     * downed peer keeps its real id (e.g. "nodo-2") on the dashboard instead of
+     * reverting to its raw URL, which matters during the fault-tolerance demo.
+     */
+    private final Map<String, String> learnedIds = new ConcurrentHashMap<>();
 
     /**
      * Builds the endpoint over this node's metrics and configuration.
@@ -114,19 +123,34 @@ public final class PanelEndpoint implements Endpoint {
                     .GET()
                     .build();
             return http.sendAsync(request, HttpResponse.BodyHandlers.ofString())
-                    .handle((response, error) ->
-                            (error == null && response.statusCode() == 200)
-                                    ? response.body()
-                                    : downNode(base));
+                    .handle((response, error) -> {
+                        if (error == null && response.statusCode() == 200) {
+                            rememberId(base, response.body());
+                            return response.body();
+                        }
+                        return downNode(base);
+                    });
         } catch (RuntimeException e) {
             return CompletableFuture.completedFuture(downNode(base));
+        }
+    }
+
+    /** Records the node id a peer reported, so a later down card keeps it. */
+    private void rememberId(String base, String body) {
+        try {
+            String id = gson.fromJson(body, JsonObject.class).get("nodeId").getAsString();
+            if (id != null && !id.isBlank()) {
+                learnedIds.put(base, id);
+            }
+        } catch (RuntimeException e) {
+            // A malformed peer body just leaves the previously learned id intact.
         }
     }
 
     /** A placeholder snapshot for a node that did not answer. */
     private String downNode(String base) {
         JsonObject node = new JsonObject();
-        node.addProperty("nodeId", base);
+        node.addProperty("nodeId", learnedIds.getOrDefault(base, base));
         node.addProperty("role", "replica");
         node.addProperty("status", "down");
         node.addProperty("accountCount", 0);
