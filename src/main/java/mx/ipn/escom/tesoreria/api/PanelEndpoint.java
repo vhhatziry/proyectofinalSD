@@ -1,8 +1,16 @@
 package mx.ipn.escom.tesoreria.api;
 
+import java.net.URI;
 import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.CompletableFuture;
 
 import com.google.gson.Gson;
+import com.google.gson.JsonObject;
 
 import mx.ipn.escom.tesoreria.app.NodeConfig;
 import mx.ipn.escom.tesoreria.app.NodeStats;
@@ -23,8 +31,15 @@ public final class PanelEndpoint implements Endpoint {
     /** Shared JSON codec for building the aggregated reply. */
     private final Gson gson = new Gson();
 
-    /** HTTP client used to pull each peer's /api/stats over the wire. */
-    private final HttpClient http = HttpClient.newHttpClient();
+    /**
+     * HTTP client used to pull each peer's /api/stats over the wire. A bounded
+     * connect timeout is essential: a host that drops connection attempts (a
+     * downed replica behind a firewall) would otherwise hang the panel well past
+     * the per-request timeout, which only covers the response phase.
+     */
+    private final HttpClient http = HttpClient.newBuilder()
+            .connectTimeout(Duration.ofMillis(800))
+            .build();
 
     /** This node's live metrics. */
     private final NodeStats stats;
@@ -52,10 +67,76 @@ public final class PanelEndpoint implements Endpoint {
      */
     @Override
     public Reply serve(Request req) {
-        // TODO: enforce GET (405 otherwise); build an array starting with the local
-        // NodeStats snapshot, then for each peer in config.peers() GET /api/stats with
-        // the HttpClient (marking unreachable peers as down); return 200 with the
-        // aggregated JSON.
-        throw new UnsupportedOperationException("TODO");
+        if (!"GET".equals(req.method())) {
+            return Reply.status(405);
+        }
+        // Fetch every peer concurrently so a downed replica adds at most one
+        // timeout to the panel latency, not one timeout per peer.
+        List<CompletableFuture<String>> pending = new ArrayList<>();
+        for (String peer : peerBaseUrls()) {
+            pending.add(fetchPeer(peer));
+        }
+        StringBuilder nodes = new StringBuilder();
+        nodes.append("{\"nodes\":[").append(stats.toJson());
+        for (CompletableFuture<String> peer : pending) {
+            nodes.append(',').append(peer.join());
+        }
+        nodes.append("]}");
+        return Reply.json(200, nodes.toString());
+    }
+
+    /** Splits TES_PEERS into trimmed, non-empty base URLs. */
+    private String[] peerBaseUrls() {
+        String raw = config.peers();
+        if (raw == null || raw.isBlank()) {
+            return new String[0];
+        }
+        String[] parts = raw.split(",");
+        int count = 0;
+        for (String part : parts) {
+            if (!part.trim().isEmpty()) {
+                parts[count++] = part.trim();
+            }
+        }
+        String[] result = new String[count];
+        System.arraycopy(parts, 0, result, 0, count);
+        return result;
+    }
+
+    /**
+     * Pulls a peer's own stats over HTTP. An unreachable or slow peer never
+     * fails the panel: it is reported as a down node instead.
+     */
+    private CompletableFuture<String> fetchPeer(String base) {
+        try {
+            HttpRequest request = HttpRequest.newBuilder(URI.create(base + "/api/stats"))
+                    .timeout(Duration.ofMillis(1500))
+                    .GET()
+                    .build();
+            return http.sendAsync(request, HttpResponse.BodyHandlers.ofString())
+                    .handle((response, error) ->
+                            (error == null && response.statusCode() == 200)
+                                    ? response.body()
+                                    : downNode(base));
+        } catch (RuntimeException e) {
+            return CompletableFuture.completedFuture(downNode(base));
+        }
+    }
+
+    /** A placeholder snapshot for a node that did not answer. */
+    private String downNode(String base) {
+        JsonObject node = new JsonObject();
+        node.addProperty("nodeId", base);
+        node.addProperty("role", "replica");
+        node.addProperty("status", "down");
+        node.addProperty("accountCount", 0);
+        node.addProperty("totalBalance", 0);
+        node.addProperty("transferCount", 0);
+        node.addProperty("lastTxId", 0);
+        node.addProperty("cpuPercent", 0);
+        node.addProperty("ramPercent", 0);
+        node.addProperty("diskPercent", 0);
+        node.addProperty("gcsCount", 0);
+        return gson.toJson(node);
     }
 }

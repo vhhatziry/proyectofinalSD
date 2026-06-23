@@ -1,7 +1,17 @@
 package mx.ipn.escom.tesoreria.app;
 
+import java.io.File;
+import java.io.IOException;
+import java.math.BigDecimal;
+import java.nio.file.Files;
+import java.nio.file.Path;
+
+import com.google.gson.Gson;
+import com.google.gson.JsonObject;
+
 import mx.ipn.escom.tesoreria.core.Bank;
 import mx.ipn.escom.tesoreria.core.Ledger;
+import mx.ipn.escom.tesoreria.core.Money;
 import mx.ipn.escom.tesoreria.durable.Journal;
 
 /**
@@ -25,6 +35,12 @@ public final class NodeStats {
     private final Bank bank;
     private final Journal journal;
     private final NodeConfig config;
+
+    // Previous /proc/stat sample so CPU% is the busy fraction between two reads
+    // (i.e. between two dashboard refreshes), guarded for concurrent requests.
+    private final Object cpuLock = new Object();
+    private long prevCpuTotal;
+    private long prevCpuIdle;
 
     /**
      * Creates a stats collector bound to this node's live components.
@@ -51,45 +67,65 @@ public final class NodeStats {
         return config.isLeader() ? "leader" : "replica";
     }
 
-    /** Liveness status of this node, e.g. "UP". */
+    /** Liveness status of this node: a node answering its own stats is up. */
     public String status() {
-        // TODO: report runtime status; constant "UP" while serving.
-        throw new UnsupportedOperationException("TODO");
+        return "up";
     }
 
     /** Number of accounts loaded in the in-memory ledger. */
     public int accountCount() {
-        // TODO: delegate to ledger account map size.
-        throw new UnsupportedOperationException("TODO");
+        return ledger.size();
     }
 
     /** Total balance across all accounts, in cents (conservation invariant target). */
     public long totalCents() {
-        // TODO: delegate to ledger.totalCents().
-        throw new UnsupportedOperationException("TODO");
+        return ledger.totalCents();
     }
 
     /** Number of committed transfers on this node. */
     public long transferCount() {
-        // TODO: delegate to bank.appliedCount().
-        throw new UnsupportedOperationException("TODO");
+        return bank.appliedCount();
     }
 
     /** Sequence id of the last applied transaction (0 if none yet). */
     public long lastTxId() {
-        // TODO: delegate to bank.lastSeq().
-        throw new UnsupportedOperationException("TODO");
+        return bank.lastSeq();
     }
 
     /**
-     * CPU usage of the host as a fraction in the range [0, 100], sampled from
+     * CPU usage of the host as a percentage in [0, 100], sampled from
      * {@code /proc/stat} (busy vs idle jiffies between two reads).
      *
      * @return percentage of CPU in use
      */
     public double cpuPercent() {
-        // TODO: parse /proc/stat with raw java.io, no libraries.
-        throw new UnsupportedOperationException("TODO");
+        try {
+            String[] f = cpuFields();
+            if (f.length < 5) {
+                return 0.0;
+            }
+            long total = 0L;
+            long idle = 0L;
+            for (int i = 1; i < f.length; i++) {
+                long value = Long.parseLong(f[i]);
+                total += value;
+                if (i == 4 || i == 5) {
+                    idle += value; // idle + iowait
+                }
+            }
+            synchronized (cpuLock) {
+                long deltaTotal = total - prevCpuTotal;
+                long deltaIdle = idle - prevCpuIdle;
+                prevCpuTotal = total;
+                prevCpuIdle = idle;
+                if (deltaTotal <= 0L) {
+                    return 0.0;
+                }
+                return clamp((1.0 - (double) deltaIdle / deltaTotal) * 100.0);
+            }
+        } catch (RuntimeException | IOException e) {
+            return 0.0;
+        }
     }
 
     /**
@@ -99,8 +135,16 @@ public final class NodeStats {
      * @return percentage of RAM in use
      */
     public double ramPercent() {
-        // TODO: parse /proc/meminfo with raw java.io, no libraries.
-        throw new UnsupportedOperationException("TODO");
+        try {
+            long total = readMeminfo("MemTotal");
+            long available = readMeminfo("MemAvailable");
+            if (total <= 0L) {
+                return 0.0;
+            }
+            return clamp((double) (total - available) / total * 100.0);
+        } catch (RuntimeException | IOException e) {
+            return 0.0;
+        }
     }
 
     /**
@@ -110,8 +154,13 @@ public final class NodeStats {
      * @return percentage of disk in use
      */
     public double diskPercent() {
-        // TODO: use File.getTotalSpace / File.getUsableSpace.
-        throw new UnsupportedOperationException("TODO");
+        File root = new File("/");
+        long total = root.getTotalSpace();
+        long usable = root.getUsableSpace();
+        if (total <= 0L) {
+            return 0.0;
+        }
+        return clamp((double) (total - usable) / total * 100.0);
     }
 
     /**
@@ -121,17 +170,59 @@ public final class NodeStats {
      * @return count of journal objects in GCS
      */
     public long gcsCount() {
-        // TODO: return journal.stored() when journal != null, else 0.
-        throw new UnsupportedOperationException("TODO");
+        return (journal != null) ? journal.stored() : 0L;
     }
 
     /**
      * Serializes this node's metrics to the JSON shape consumed by the panel.
+     * The keys match the {@code data-field} names in dashboard.html exactly.
      *
      * @return JSON object string with status, counts, balances and host usage
      */
     public String toJson() {
-        // TODO: build JSON with gson from the fields above.
-        throw new UnsupportedOperationException("TODO");
+        JsonObject node = new JsonObject();
+        node.addProperty("nodeId", nodeId());
+        node.addProperty("role", role());
+        node.addProperty("status", status());
+        node.addProperty("accountCount", accountCount());
+        node.addProperty("totalBalance", new BigDecimal(Money.toDecimal(totalCents())));
+        node.addProperty("transferCount", transferCount());
+        node.addProperty("lastTxId", lastTxId());
+        node.addProperty("cpuPercent", round1(cpuPercent()));
+        node.addProperty("ramPercent", round1(ramPercent()));
+        node.addProperty("diskPercent", round1(diskPercent()));
+        node.addProperty("gcsCount", gcsCount());
+        return new Gson().toJson(node);
+    }
+
+    /** Reads the aggregate "cpu" line of /proc/stat split into fields. */
+    private static String[] cpuFields() throws IOException {
+        for (String line : Files.readAllLines(Path.of("/proc/stat"))) {
+            if (line.startsWith("cpu ")) {
+                return line.trim().split("\\s+");
+            }
+        }
+        return new String[0];
+    }
+
+    /** Reads a kB value from /proc/meminfo by key (e.g. "MemTotal"). */
+    private static long readMeminfo(String key) throws IOException {
+        for (String line : Files.readAllLines(Path.of("/proc/meminfo"))) {
+            if (line.startsWith(key + ":")) {
+                String[] parts = line.trim().split("\\s+");
+                return Long.parseLong(parts[1]);
+            }
+        }
+        return 0L;
+    }
+
+    /** Constrains a percentage to the [0, 100] range. */
+    private static double clamp(double value) {
+        return Math.max(0.0, Math.min(100.0, value));
+    }
+
+    /** Rounds a percentage to a single decimal place. */
+    private static double round1(double value) {
+        return Math.round(value * 10.0) / 10.0;
     }
 }

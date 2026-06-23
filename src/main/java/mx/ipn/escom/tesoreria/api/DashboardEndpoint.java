@@ -35,9 +35,16 @@ public final class DashboardEndpoint implements Endpoint {
      */
     @Override
     public Reply serve(Request req) {
-        // TODO: enforce GET (405 otherwise); load RESOURCE from the classpath
-        // (getClass().getResourceAsStream), read all bytes, return 404 when the
-        // resource is absent, otherwise return Reply.html(200, bytes).
-        throw new UnsupportedOperationException("TODO");
+        if (!"GET".equals(req.method())) {
+            return Reply.status(405);
+        }
+        try (InputStream in = getClass().getResourceAsStream(RESOURCE)) {
+            if (in == null) {
+                return Reply.status(404);
+            }
+            return Reply.html(200, in.readAllBytes());
+        } catch (IOException e) {
+            return Reply.status(500);
+        }
     }
 }

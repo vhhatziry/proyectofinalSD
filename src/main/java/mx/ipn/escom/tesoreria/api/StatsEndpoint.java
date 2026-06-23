@@ -39,8 +39,9 @@ public final class StatsEndpoint implements Endpoint {
      */
     @Override
     public Reply serve(Request req) {
-        // TODO: enforce GET (405 otherwise); read a fresh snapshot from NodeStats and
-        // return 200 with its JSON serialization.
-        throw new UnsupportedOperationException("TODO");
+        if (!"GET".equals(req.method())) {
+            return Reply.status(405);
+        }
+        return Reply.json(200, stats.toJson());
     }
 }
