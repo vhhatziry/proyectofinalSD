@@ -28,7 +28,7 @@ public final class Bank {
     private final Ledger ledger;
     private final AtomicLong sequence = new AtomicLong(0L);
     private final AtomicLong applied = new AtomicLong(0L);
-    private volatile long lastSeq = 0L;
+    private final AtomicLong lastSeq = new AtomicLong(0L);
     private final TransferLog log = new TransferLog();
     private final List<CommitListener> listeners = new CopyOnWriteArrayList<>();
 
@@ -61,7 +61,7 @@ public final class Bank {
         Transfer committed = new Transfer(seq, from, to, cents);
         log.append(committed);
         applied.incrementAndGet();
-        lastSeq = seq;
+        lastSeq.accumulateAndGet(seq, Math::max);
         for (CommitListener listener : listeners) {
             listener.onCommit(committed);
         }
@@ -69,15 +69,26 @@ public final class Bank {
     }
 
     /**
-     * Replays a transfer that the leader already committed. The movement is
-     * attempted against the local ledger; a missing account is tolerated (a
-     * replica may not have every account materialized) by swallowing that
-     * particular failure, while the entry is still recorded so the log mirrors
-     * the leader. The local sequence counter is raised to the entry's sequence
-     * under a lock with an explicit comparison, so it never moves backwards and
-     * never advances past what has actually been seen.
+     * Replays a transfer that the leader already committed. Used on two paths:
+     * by a replica applying the leader's stream, and by the leader's own cold
+     * recovery replaying the durable journal. Both share the same exactly-once
+     * contract.
+     *
+     * <p>The call is <b>idempotent</b>: a transfer whose sequence is at or below
+     * the highest already applied is ignored, so an overlap resent after a
+     * reconnect never double-applies and corrupts balances. A fresh transfer is
+     * moved against the local ledger (a missing account is tolerated, since a
+     * follower may not have materialized every account), recorded in the log so
+     * it mirrors the leader, and counted. Both the applied watermark
+     * ({@code lastSeq}) and the sequence counter are then raised to this entry's
+     * sequence: raising {@code sequence} is what lets the leader resume numbering
+     * after cold recovery from the highest journaled sequence instead of from 0,
+     * so the next client transfer never reuses a sequence already in the journal.
      */
-    public void applyReplicated(Transfer t) {
+    public synchronized void applyReplicated(Transfer t) {
+        if (t.seq() <= lastSeq.get()) {
+            return; // already applied: a duplicate from a reconnect or replay
+        }
         try {
             ledger.move(t.from(), t.to(), t.cents());
         } catch (TransferException e) {
@@ -91,11 +102,8 @@ public final class Bank {
         }
         log.append(t);
         applied.incrementAndGet();
-        synchronized (this) {
-            if (t.seq() > lastSeq) {
-                lastSeq = t.seq();
-            }
-        }
+        lastSeq.accumulateAndGet(t.seq(), Math::max);
+        sequence.accumulateAndGet(t.seq(), Math::max);
     }
 
     /** Highest sequence number handed out so far on this node. */
@@ -110,7 +118,7 @@ public final class Bank {
 
     /** Sequence number of the most recently committed transfer. */
     public long lastSeq() {
-        return lastSeq;
+        return lastSeq.get();
     }
 
     /** The commit log, shared with the replica feed for catch-up. */
