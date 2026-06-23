@@ -4,6 +4,7 @@ import com.google.gson.Gson;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 
 import mx.ipn.escom.tesoreria.core.Transfer;
 
@@ -23,10 +24,15 @@ import java.util.List;
  * Thin client over the Cloud Storage JSON API for the transfer journal,
  * built directly on java.net.http with no Google SDK.
  *
- * Each committed transfer is stored as one object named
- * journal/tx-&lt;seq&gt;.json. Objects are uploaded via the simple media upload
- * endpoint and listed/fetched via the JSON API, always carrying a bearer
- * token obtained from {@link GcsAuth}. Payloads are (de)serialized with gson.
+ * Transfers are stored under the journal/ prefix. A single transfer can be
+ * written as journal/tx-&lt;seq&gt;.json via {@link #put(Transfer)}, but the hot
+ * path uses {@link #putBatch(java.util.List)}, which composes many transfers
+ * into one object journal/batch-&lt;min&gt;-&lt;max&gt;.json so the durable log keeps
+ * up with a high commit rate (Cloud Storage has no append; composing objects is
+ * the contract's sanctioned alternative). Objects are uploaded via the simple
+ * media upload endpoint and listed/fetched via the JSON API, always carrying a
+ * bearer token from {@link GcsAuth}. {@link #readAll()} flattens both single and
+ * batched objects back into a sequence-ordered list. Payloads use gson.
  */
 public final class GcsStore {
 
@@ -86,6 +92,37 @@ public final class GcsStore {
     }
 
     /**
+     * Uploads a batch of transfers as one composed object
+     * journal/batch-&lt;min&gt;-&lt;max&gt;.json (a JSON array), so the durable log can
+     * keep pace with the commit rate. The object is named by the batch's minimum
+     * and maximum sequence; recovery re-sorts by sequence regardless of order.
+     *
+     * @param batch the committed transfers to persist together (non-empty)
+     * @throws IOException          if the upload fails or returns non-2xx
+     * @throws InterruptedException if the HTTP exchange is interrupted
+     */
+    public void putBatch(List<Transfer> batch) throws IOException, InterruptedException {
+        if (batch.isEmpty()) {
+            return;
+        }
+        long min = batch.stream().mapToLong(Transfer::seq).min().getAsLong();
+        long max = batch.stream().mapToLong(Transfer::seq).max().getAsLong();
+        String name = PREFIX + "batch-" + min + "-" + max + ".json";
+        String url = UPLOAD_BASE + bucket + "/o?uploadType=media&name=" + enc(name);
+        HttpRequest request = HttpRequest.newBuilder(URI.create(url))
+                .timeout(HTTP_TIMEOUT)
+                .header("Authorization", "Bearer " + auth.accessToken())
+                .header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString(gson.toJson(batch)))
+                .build();
+        HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString());
+        if (response.statusCode() / 100 != 2) {
+            throw new IOException("GCS upload of " + name + " returned "
+                    + response.statusCode() + ": " + response.body());
+        }
+    }
+
+    /**
      * Counts the journal objects currently stored under the prefix.
      *
      * @return the number of persisted transfers
@@ -116,7 +153,14 @@ public final class GcsStore {
             if (response.statusCode() / 100 != 2) {
                 throw new IOException("GCS fetch of " + name + " returned " + response.statusCode());
             }
-            transfers.add(gson.fromJson(response.body(), Transfer.class));
+            JsonElement parsed = JsonParser.parseString(response.body());
+            if (parsed.isJsonArray()) {
+                for (JsonElement element : parsed.getAsJsonArray()) {
+                    transfers.add(gson.fromJson(element, Transfer.class));
+                }
+            } else {
+                transfers.add(gson.fromJson(parsed, Transfer.class));
+            }
         }
         transfers.sort(Comparator.comparingLong(Transfer::seq));
         return transfers;
