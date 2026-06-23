@@ -116,10 +116,20 @@ public final class ReplicaFeed implements CommitListener {
                     new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
             String greeting = reader.readLine();
             long since = parseCatchup(greeting);
-            for (Transfer t : log.since(since)) {
-                writeLine(socket, WireCodec.encode(t));
+            // Replay the backlog and join the live audience atomically with
+            // respect to onCommit, which also holds broadcastLock. This closes
+            // the window where a commit landing between the end of the backlog
+            // and the subscribe would never reach this replica, and keeps the
+            // backlog writes from interleaving with a live broadcast on the same
+            // socket. A connecting replica briefly pauses live fan-out for the
+            // length of its replay; that cost is bounded and only paid at
+            // (re)connect time.
+            synchronized (broadcastLock) {
+                for (Transfer t : log.since(since)) {
+                    writeLine(socket, WireCodec.encode(t));
+                }
+                subscribers.add(socket);
             }
-            subscribers.add(socket);
         } catch (IOException ex) {
             closeQuietly(socket);
         }
