@@ -6,6 +6,7 @@ import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
+import java.util.TreeMap;
 
 import mx.ipn.escom.tesoreria.core.Bank;
 import mx.ipn.escom.tesoreria.core.Transfer;
@@ -16,16 +17,23 @@ import mx.ipn.escom.tesoreria.core.Transfer;
  *
  * <p>This synchronizer keeps a follower node aligned with the leader. It dials
  * the leader's replication port and opens the conversation with a one-line
- * greeting {@code "CATCHUP <seq>"}, where the sequence is the watermark the
- * local {@link Bank} has already applied. The leader then streams, as JSON lines,
- * first the backlog past that watermark and afterwards every live commit. Each
- * incoming line is turned back into a {@link Transfer} by {@link WireCodec} and
- * handed to {@link Bank#applyReplicated(Transfer)}.
+ * greeting {@code "CATCHUP <seq>"}, where the sequence is {@link Bank#lastSeq()},
+ * the highest transfer the local {@link Bank} has already applied. The leader then
+ * streams, as JSON lines, first the backlog past that watermark and afterwards
+ * every live commit. Each incoming line is turned back into a {@link Transfer} by
+ * {@link WireCodec}.
+ *
+ * <p>Incoming transfers are applied through a small reorder buffer so the bank
+ * always sees them in strict, gap-free sequence order. The leader fans commits
+ * out from concurrent threads, so a higher sequence can arrive before a lower
+ * one; the buffer holds out-of-order arrivals until the missing sequences fill
+ * in, then drains them contiguously into {@link Bank#applyReplicated(Transfer)}.
+ * A transfer at or below the bank's watermark is a duplicate and is dropped, so
+ * an overlap resent after a reconnect is harmless.
  *
  * <p>The link is treated as unreliable. The reader runs inside a loop that, on
  * any drop, waits briefly and dials again, re-issuing CATCHUP with the bank's
- * latest sequence so the replay resumes from the new watermark rather than from
- * scratch.
+ * latest watermark so the replay resumes from there rather than from scratch.
  */
 public final class ReplicaSync {
 
@@ -100,17 +108,19 @@ public final class ReplicaSync {
     private void consumeStream() throws IOException {
         Socket connection = new Socket(leaderHost, port);
         socket = connection;
+        // Fresh buffer per connection: a reconnect re-fetches from the watermark,
+        // so any stale out-of-order remainder from the previous link is discarded.
+        TreeMap<Long, Transfer> pending = new TreeMap<>();
         try {
             OutputStream out = connection.getOutputStream();
-            out.write(("CATCHUP " + bank.sequence() + "\n").getBytes(StandardCharsets.UTF_8));
+            out.write(("CATCHUP " + bank.lastSeq() + "\n").getBytes(StandardCharsets.UTF_8));
             out.flush();
             BufferedReader reader = new BufferedReader(
                     new InputStreamReader(connection.getInputStream(), StandardCharsets.UTF_8));
             String line;
             while (running && (line = reader.readLine()) != null) {
                 try {
-                    Transfer t = WireCodec.decode(line);
-                    bank.applyReplicated(t);
+                    bufferAndDrain(pending, WireCodec.decode(line));
                 } catch (RuntimeException ex) {
                     // A corrupted line must not kill the reader: break so the
                     // outer loop reconnects and the leader resends from the
@@ -121,6 +131,25 @@ public final class ReplicaSync {
         } finally {
             closeQuietly(connection);
             socket = null;
+        }
+    }
+
+    /**
+     * Buffers one received transfer and applies every transfer that is now
+     * contiguous with the bank's watermark, in strict sequence order.
+     *
+     * @param pending out-of-order arrivals waiting for their predecessors
+     * @param t       the freshly received transfer
+     */
+    private void bufferAndDrain(TreeMap<Long, Transfer> pending, Transfer t) {
+        if (t.seq() > bank.lastSeq()) {
+            pending.put(t.seq(), t);
+        }
+        while (!pending.isEmpty() && pending.firstKey() <= bank.lastSeq() + 1) {
+            Transfer next = pending.pollFirstEntry().getValue();
+            if (next.seq() > bank.lastSeq()) {
+                bank.applyReplicated(next);
+            }
         }
     }
 
