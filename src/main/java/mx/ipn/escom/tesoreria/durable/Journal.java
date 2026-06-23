@@ -44,9 +44,11 @@ public final class Journal implements CommitListener {
      * @throws InterruptedException if an HTTP exchange is interrupted
      */
     public int recover(CommitListener apply) throws IOException, InterruptedException {
-        // TODO: List<Transfer> all = store.readAll();
-        // for (Transfer t : all) apply.onCommit(t); return all.size();
-        throw new UnsupportedOperationException("TODO");
+        List<Transfer> all = store.readAll();
+        for (Transfer t : all) {
+            apply.onCommit(t);
+        }
+        return all.size();
     }
 
     /**
@@ -55,8 +57,7 @@ public final class Journal implements CommitListener {
      * @param recovered the count returned by {@link #recover(CommitListener)}
      */
     public void start(int recovered) {
-        // TODO: stored.set(recovered);
-        throw new UnsupportedOperationException("TODO");
+        stored.set(recovered);
     }
 
     /**
@@ -67,8 +68,8 @@ public final class Journal implements CommitListener {
      * @throws InterruptedException if the HTTP exchange is interrupted
      */
     public void record(Transfer transfer) throws IOException, InterruptedException {
-        // TODO: store.put(transfer); stored.incrementAndGet();
-        throw new UnsupportedOperationException("TODO");
+        store.put(transfer);
+        stored.incrementAndGet();
     }
 
     /**
@@ -80,9 +81,15 @@ public final class Journal implements CommitListener {
      */
     @Override
     public void onCommit(Transfer transfer) {
-        // TODO: try { record(transfer); } catch (IOException | InterruptedException e) {
-        // restore interrupt if needed and log; do not rethrow. }
-        throw new UnsupportedOperationException("TODO");
+        try {
+            record(transfer);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            System.err.println("journal: interrupted persisting seq " + transfer.seq());
+        } catch (IOException e) {
+            System.err.println("journal: could not persist seq " + transfer.seq()
+                    + ": " + e.getMessage());
+        }
     }
 
     /**

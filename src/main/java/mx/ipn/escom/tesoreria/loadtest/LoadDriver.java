@@ -123,9 +123,26 @@ public final class LoadDriver {
      * @throws Exception if the handshake fails
      */
     static String bootstrapToken(String baseUrl) throws Exception {
-        // TODO: POST /api/register with {"username":...,"password":...}; ignore 409.
-        // TODO: POST /api/login with the same body; parse the JWT from the reply.
-        throw new UnsupportedOperationException("TODO");
+        HttpClient http = newClient();
+        String creds = "{\"username\":\"loaddriver\",\"password\":\"loadpass\"}";
+        HttpRequest register = HttpRequest.newBuilder(URI.create(baseUrl + "/api/register"))
+                .timeout(Duration.ofSeconds(10))
+                .header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString(creds))
+                .build();
+        // 201 created or 409 already-registered are both fine: we only need a login.
+        http.send(register, HttpResponse.BodyHandlers.ofString());
+        HttpRequest login = HttpRequest.newBuilder(URI.create(baseUrl + "/api/login"))
+                .timeout(Duration.ofSeconds(10))
+                .header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString(creds))
+                .build();
+        HttpResponse<String> response = http.send(login, HttpResponse.BodyHandlers.ofString());
+        if (response.statusCode() != 200) {
+            throw new IllegalStateException("login failed: " + response.statusCode()
+                    + " " + response.body());
+        }
+        return new Gson().fromJson(response.body(), JsonObject.class).get("token").getAsString();
     }
 
     /**
@@ -156,9 +173,13 @@ public final class LoadDriver {
      * @return {@code true} if the server returned HTTP 200 with a balance
      */
     boolean doRead(HttpClient http) {
-        // TODO: GET /api/accounts/{id} with Authorization: Bearer <jwt>.
-        // TODO: on 200, parse {"id","propietario","balance"} and reads.incrementAndGet().
-        throw new UnsupportedOperationException("TODO");
+        HttpRequest request = authorized("/api/accounts/" + randomAccountId()).GET().build();
+        String body = send(http, request, 200);
+        if (body == null) {
+            return false;
+        }
+        reads.incrementAndGet();
+        return true;
     }
 
     /**
@@ -169,11 +190,35 @@ public final class LoadDriver {
      * @return {@code true} if the server accepted the transfer (HTTP 200)
      */
     boolean doTransfer(HttpClient http) {
-        // TODO: pick two distinct ids and a small positive amount.
-        // TODO: POST /api/transactions/transfer with the mandatory body shape:
-        //       {"sourceAccountId":"<id>","targetAccountId":"<id>","amount":<decimal>}.
-        // TODO: on 200, transfers.incrementAndGet().
-        throw new UnsupportedOperationException("TODO");
+        int from = randomAccountId();
+        int to = randomAccountId();
+        if (from == to) {
+            to = (to < maxAccountId) ? to + 1 : minAccountId;
+            if (from == to) {
+                return false;
+            }
+        }
+        HttpRequest request = authorized("/api/transactions/transfer")
+                .header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString(transferBody(from, to, randomAmount())))
+                .build();
+        String body = send(http, request, 200);
+        if (body == null) {
+            return false;
+        }
+        transfers.incrementAndGet();
+        return true;
+    }
+
+    /**
+     * Picks a small positive transfer amount as a two-decimal string, between
+     * 0.01 and 100.00, kept low so transfers rarely exhaust an account.
+     *
+     * @return a decimal amount such as {@code "37.50"}
+     */
+    String randomAmount() {
+        long cents = ThreadLocalRandom.current().nextLong(1, 10001);
+        return BigDecimal.valueOf(cents).movePointLeft(2).setScale(2).toPlainString();
     }
 
     /**
@@ -184,8 +229,16 @@ public final class LoadDriver {
      * @return total balance across the account range, in cents
      */
     long captureTotalCents() {
-        // TODO: GET each /api/accounts/{id} once, sum balance converted via toCents().
-        throw new UnsupportedOperationException("TODO");
+        HttpClient http = newClient();
+        long total = 0L;
+        for (int id = minAccountId; id <= maxAccountId; id++) {
+            HttpRequest request = authorized("/api/accounts/" + id).GET().build();
+            String body = send(http, request, 200);
+            if (body != null) {
+                total += parseBalanceCents(body);
+            }
+        }
+        return total;
     }
 
     /**
@@ -222,9 +275,17 @@ public final class LoadDriver {
      * @param actualCents   the total actually observed
      */
     void reportCulprit(long expectedCents, long actualCents) {
-        // TODO: re-read the range and print the first account with a negative or
-        //       otherwise impossible balance.
-        throw new UnsupportedOperationException("TODO");
+        HttpClient http = newClient();
+        for (int id = minAccountId; id <= maxAccountId; id++) {
+            HttpRequest request = authorized("/api/accounts/" + id).GET().build();
+            String body = send(http, request, 200);
+            if (body != null && parseBalanceCents(body) < 0L) {
+                System.out.println("culprit: account " + id + " has a negative balance");
+                return;
+            }
+        }
+        System.out.println("no single negative account found; the "
+                + (actualCents - expectedCents) + " cent gap is spread across the range");
     }
 
     /**

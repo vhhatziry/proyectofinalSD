@@ -12,10 +12,12 @@ import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.security.GeneralSecurityException;
 import java.security.KeyFactory;
 import java.security.PrivateKey;
 import java.security.Signature;
 import java.security.spec.PKCS8EncodedKeySpec;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.Base64;
 
@@ -38,6 +40,9 @@ public final class GcsAuth {
     /** Assertion grant type required by the OAuth2 token endpoint. */
     private static final String GRANT_TYPE = "urn:ietf:params:oauth:grant-type:jwt-bearer";
 
+    /** Default token endpoint used when the key file omits token_uri. */
+    private static final String DEFAULT_TOKEN_URI = "https://oauth2.googleapis.com/token";
+
     /** Lifetime in seconds requested for each minted assertion (max 3600). */
     private static final long TOKEN_TTL_SECONDS = 3600L;
 
@@ -47,7 +52,7 @@ public final class GcsAuth {
     private final Gson gson = new Gson();
     private final HttpClient http = HttpClient.newHttpClient();
 
-    /** Service account email used as the JWT issuer and subject. */
+    /** Service account email used as the JWT issuer. */
     private final String clientEmail;
 
     /** OAuth2 token endpoint to POST the signed assertion to. */
@@ -68,9 +73,17 @@ public final class GcsAuth {
      * @param keyFile path to the TES_GCS_KEYFILE service account credentials
      */
     public GcsAuth(Path keyFile) {
-        // TODO: read keyFile, parse JSON, extract client_email/private_key/token_uri,
-        // decode the PEM body and build the PrivateKey via parsePrivateKey.
-        throw new UnsupportedOperationException("TODO");
+        try {
+            String json = Files.readString(keyFile, StandardCharsets.UTF_8);
+            JsonObject sa = gson.fromJson(json, JsonObject.class);
+            this.clientEmail = sa.get("client_email").getAsString();
+            this.tokenUri = sa.has("token_uri")
+                    ? sa.get("token_uri").getAsString()
+                    : DEFAULT_TOKEN_URI;
+            this.privateKey = parsePrivateKey(sa.get("private_key").getAsString());
+        } catch (IOException | GeneralSecurityException | RuntimeException e) {
+            throw new IllegalStateException("cannot load GCS service-account key from " + keyFile, e);
+        }
     }
 
     /**
@@ -82,9 +95,12 @@ public final class GcsAuth {
      * @throws InterruptedException if the HTTP exchange is interrupted
      */
     public synchronized String accessToken() throws IOException, InterruptedException {
-        // TODO: if cachedToken is fresh (now < cachedExpiry - skew) return it;
-        // otherwise call refresh() and return the new token.
-        throw new UnsupportedOperationException("TODO");
+        long now = Instant.now().getEpochSecond();
+        if (cachedToken != null && now < cachedExpiry - REFRESH_SKEW_SECONDS) {
+            return cachedToken;
+        }
+        refresh();
+        return cachedToken;
     }
 
     /**
@@ -95,24 +111,48 @@ public final class GcsAuth {
      * @throws InterruptedException if the HTTP exchange is interrupted
      */
     private void refresh() throws IOException, InterruptedException {
-        // TODO: assertion = buildAssertion(); form body =
-        // "grant_type=" + enc(GRANT_TYPE) + "&assertion=" + enc(assertion);
-        // POST to tokenUri with Content-Type application/x-www-form-urlencoded;
-        // parse access_token + expires_in; set cachedToken and cachedExpiry.
-        throw new UnsupportedOperationException("TODO");
+        String assertion = buildAssertion();
+        String form = "grant_type=" + enc(GRANT_TYPE) + "&assertion=" + enc(assertion);
+        HttpRequest request = HttpRequest.newBuilder(URI.create(tokenUri))
+                .timeout(Duration.ofSeconds(10))
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .POST(HttpRequest.BodyPublishers.ofString(form))
+                .build();
+        HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString());
+        if (response.statusCode() / 100 != 2) {
+            throw new IOException("token endpoint returned " + response.statusCode()
+                    + ": " + response.body());
+        }
+        JsonObject body = gson.fromJson(response.body(), JsonObject.class);
+        cachedToken = body.get("access_token").getAsString();
+        long expiresIn = body.has("expires_in")
+                ? body.get("expires_in").getAsLong()
+                : TOKEN_TTL_SECONDS;
+        cachedExpiry = Instant.now().getEpochSecond() + expiresIn;
     }
 
     /**
      * Assembles and RS256-signs the JWT assertion (header.payload.signature).
+     * The claim set is the canonical service-account jwt-bearer one: iss, scope,
+     * aud, iat, exp. No sub is sent (that is only for domain-wide delegation and
+     * would be rejected as unauthorized_client here).
      *
      * @return the compact serialized JWT assertion string
      */
     private String buildAssertion() {
-        // TODO: header {"alg":"RS256","typ":"JWT"}; claims with iss=sub=clientEmail,
-        // scope=SCOPE, aud=tokenUri, iat=now, exp=now+TOKEN_TTL_SECONDS;
-        // signingInput = b64url(header)+"."+b64url(claims);
-        // signature = sign(signingInput); return signingInput + "." + signature.
-        throw new UnsupportedOperationException("TODO");
+        long now = Instant.now().getEpochSecond();
+        JsonObject header = new JsonObject();
+        header.addProperty("alg", "RS256");
+        header.addProperty("typ", "JWT");
+        JsonObject claims = new JsonObject();
+        claims.addProperty("iss", clientEmail);
+        claims.addProperty("scope", SCOPE);
+        claims.addProperty("aud", tokenUri);
+        claims.addProperty("iat", now);
+        claims.addProperty("exp", now + TOKEN_TTL_SECONDS);
+        String signingInput = base64UrlNoPad(header.toString().getBytes(StandardCharsets.UTF_8))
+                + "." + base64UrlNoPad(claims.toString().getBytes(StandardCharsets.UTF_8));
+        return signingInput + "." + sign(signingInput);
     }
 
     /**
@@ -122,9 +162,14 @@ public final class GcsAuth {
      * @return the Base64 URL (no padding) encoded signature
      */
     private String sign(String signingInput) {
-        // TODO: Signature.getInstance("SHA256withRSA"); initSign(privateKey);
-        // update(signingInput bytes UTF-8); base64UrlNoPad(sig.sign()).
-        throw new UnsupportedOperationException("TODO");
+        try {
+            Signature signer = Signature.getInstance("SHA256withRSA");
+            signer.initSign(privateKey);
+            signer.update(signingInput.getBytes(StandardCharsets.UTF_8));
+            return base64UrlNoPad(signer.sign());
+        } catch (GeneralSecurityException e) {
+            throw new IllegalStateException("cannot sign JWT assertion", e);
+        }
     }
 
     /**
@@ -132,12 +177,15 @@ public final class GcsAuth {
      *
      * @param pem the private_key field including BEGIN/END markers
      * @return the decoded RSA {@link PrivateKey}
+     * @throws GeneralSecurityException if the key cannot be reconstructed
      */
-    private static PrivateKey parsePrivateKey(String pem) {
-        // TODO: strip "-----BEGIN PRIVATE KEY-----"/"-----END PRIVATE KEY-----"
-        // and whitespace; Base64 decode; KeyFactory.getInstance("RSA")
-        // .generatePrivate(new PKCS8EncodedKeySpec(der)).
-        throw new UnsupportedOperationException("TODO");
+    private static PrivateKey parsePrivateKey(String pem) throws GeneralSecurityException {
+        String body = pem.replace("-----BEGIN PRIVATE KEY-----", "")
+                .replace("-----END PRIVATE KEY-----", "")
+                .replaceAll("\\s", "");
+        byte[] der = Base64.getDecoder().decode(body);
+        KeyFactory factory = KeyFactory.getInstance("RSA");
+        return factory.generatePrivate(new PKCS8EncodedKeySpec(der));
     }
 
     /**

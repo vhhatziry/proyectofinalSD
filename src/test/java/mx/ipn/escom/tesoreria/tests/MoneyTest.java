@@ -2,10 +2,11 @@ package mx.ipn.escom.tesoreria.tests;
 
 import java.util.List;
 
+import mx.ipn.escom.tesoreria.core.Money;
 import mx.ipn.escom.tesoreria.tests.RunTests.Case;
 
 /**
- * Suite (skeleton) for {@link mx.ipn.escom.tesoreria.core.Money}.
+ * Suite for {@link mx.ipn.escom.tesoreria.core.Money}.
  *
  * <p>Verifies the round-trip between decimal strings and {@code long} cents:
  * {@code toCents} must use {@code BigDecimal.movePointRight(2)} with HALF_UP
@@ -31,29 +32,29 @@ public final class MoneyTest {
 
     /**
      * Asserts that representative decimal strings convert to the expected cent
-     * amounts, including HALF_UP rounding at the third decimal. (Skeleton.)
+     * amounts, including HALF_UP rounding at the third decimal.
      */
     private void toCentsParsesDecimals() {
-        // TODO: assert toCents("200.00") == 20000, toCents("15750.25") == 1575025,
-        // and a HALF_UP rounding case such as toCents("0.005") == 1.
-        throw new UnsupportedOperationException("TODO");
+        Assert.equals("toCents(200.00)", 20000L, Money.toCents("200.00"));
+        Assert.equals("toCents(15750.25)", 1575025L, Money.toCents("15750.25"));
+        Assert.equals("toCents(0.005) rounds HALF_UP", 1L, Money.toCents("0.005"));
     }
 
     /**
      * Asserts that cent amounts render with exactly two decimal places.
-     * (Skeleton.)
      */
     private void toDecimalRendersTwoPlaces() {
-        // TODO: assert toDecimal(20000).equals("200.00"), toDecimal(5).equals("0.05").
-        throw new UnsupportedOperationException("TODO");
+        Assert.equals("toDecimal(20000)", "200.00", Money.toDecimal(20000L));
+        Assert.equals("toDecimal(5)", "0.05", Money.toDecimal(5L));
+        Assert.equals("toDecimal(0)", "0.00", Money.toDecimal(0L));
     }
 
     /**
      * Asserts toDecimal(toCents(x)) is stable for valid two-decimal inputs.
-     * (Skeleton.)
      */
     private void roundTrips() {
-        // TODO: for several decimals assert toDecimal(toCents(x)).equals(x).
-        throw new UnsupportedOperationException("TODO");
+        for (String decimal : new String[] {"0.00", "1.00", "15750.25", "999999.99"}) {
+            Assert.equals("round-trip " + decimal, decimal, Money.toDecimal(Money.toCents(decimal)));
+        }
     }
 }

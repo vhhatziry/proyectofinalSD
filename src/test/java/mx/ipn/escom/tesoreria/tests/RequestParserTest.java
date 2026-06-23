@@ -1,11 +1,15 @@
 package mx.ipn.escom.tesoreria.tests;
 
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.util.List;
 
+import mx.ipn.escom.tesoreria.net.Request;
+import mx.ipn.escom.tesoreria.net.RequestParser;
 import mx.ipn.escom.tesoreria.tests.RunTests.Case;
 
 /**
- * Suite (skeleton) for {@link mx.ipn.escom.tesoreria.net.RequestParser}.
+ * Suite for {@link mx.ipn.escom.tesoreria.net.RequestParser}.
  *
  * <p>Exercises the stateful HTTP/1.1 parser: a complete request delivered in a
  * single buffer is parsed into method, path and body, and a request that arrives
@@ -29,22 +33,39 @@ public final class RequestParserTest {
 
     /**
      * Feeds the bytes of one complete request and asserts the parser reaches its
-     * terminal state exposing the parsed method, path and body. (Skeleton.)
+     * terminal state exposing the parsed method, path and body.
      */
     private void parsesCompleteRequest() {
-        // TODO: feed a full "POST /api/... HTTP/1.1" request with a body and
-        // assert the parser completes and exposes method/path/body correctly.
-        throw new UnsupportedOperationException("TODO");
+        String body = "hello, world!";
+        String raw = "POST /api/transactions/transfer HTTP/1.1\r\n"
+                + "Host: localhost\r\n"
+                + "Content-Length: " + body.length() + "\r\n"
+                + "Connection: close\r\n\r\n"
+                + body;
+        RequestParser parser = new RequestParser();
+        boolean done = parser.feed(ByteBuffer.wrap(raw.getBytes(StandardCharsets.US_ASCII)));
+        Assert.isTrue("parser reached DONE in one feed", done);
+        Request request = parser.take();
+        Assert.notNull("a request is available", request);
+        Assert.equals("method", "POST", request.method());
+        Assert.equals("path", "/api/transactions/transfer", request.path());
+        Assert.equals("body", body, request.bodyText());
     }
 
     /**
      * Feeds the request-line and headers first, asserts the parser is not yet
      * complete, then feeds the body and asserts completion with the body intact.
-     * (Skeleton.)
      */
     private void assemblesSplitRequest() {
-        // TODO: feed head bytes, assert not done; feed remaining body bytes,
-        // assert it completes and the reassembled body matches the original.
-        throw new UnsupportedOperationException("TODO");
+        String body = "abcde";
+        String head = "POST /x HTTP/1.1\r\nContent-Length: " + body.length() + "\r\n\r\n";
+        RequestParser parser = new RequestParser();
+        boolean doneAfterHead = parser.feed(ByteBuffer.wrap(head.getBytes(StandardCharsets.US_ASCII)));
+        Assert.isTrue("not complete with only head fed", !doneAfterHead);
+        boolean doneAfterBody = parser.feed(ByteBuffer.wrap(body.getBytes(StandardCharsets.US_ASCII)));
+        Assert.isTrue("complete once body is fed", doneAfterBody);
+        Request request = parser.take();
+        Assert.notNull("a request is available", request);
+        Assert.equals("reassembled body", body, request.bodyText());
     }
 }

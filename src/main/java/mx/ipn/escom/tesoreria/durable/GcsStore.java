@@ -1,6 +1,8 @@
 package mx.ipn.escom.tesoreria.durable;
 
 import com.google.gson.Gson;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 
 import mx.ipn.escom.tesoreria.core.Transfer;
@@ -12,7 +14,9 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 
 /**
@@ -34,6 +38,9 @@ public final class GcsStore {
 
     /** Base host for simple media uploads. */
     private static final String UPLOAD_BASE = "https://storage.googleapis.com/upload/storage/v1/b/";
+
+    /** Per-request ceiling for every Cloud Storage exchange. */
+    private static final Duration HTTP_TIMEOUT = Duration.ofSeconds(15);
 
     private final Gson gson = new Gson();
     private final HttpClient http = HttpClient.newHttpClient();
@@ -63,11 +70,19 @@ public final class GcsStore {
      * @throws InterruptedException if the HTTP exchange is interrupted
      */
     public void put(Transfer transfer) throws IOException, InterruptedException {
-        // TODO: name = PREFIX + "tx-" + transfer.seq() + ".json";
-        // body = gson.toJson(transfer); POST to
-        // UPLOAD_BASE + bucket + "/o?uploadType=media&name=" + enc(name)
-        // with Authorization Bearer and Content-Type application/json.
-        throw new UnsupportedOperationException("TODO");
+        String name = PREFIX + "tx-" + transfer.seq() + ".json";
+        String url = UPLOAD_BASE + bucket + "/o?uploadType=media&name=" + enc(name);
+        HttpRequest request = HttpRequest.newBuilder(URI.create(url))
+                .timeout(HTTP_TIMEOUT)
+                .header("Authorization", "Bearer " + auth.accessToken())
+                .header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString(gson.toJson(transfer)))
+                .build();
+        HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString());
+        if (response.statusCode() / 100 != 2) {
+            throw new IOException("GCS upload of " + name + " returned "
+                    + response.statusCode() + ": " + response.body());
+        }
     }
 
     /**
@@ -78,8 +93,7 @@ public final class GcsStore {
      * @throws InterruptedException if the HTTP exchange is interrupted
      */
     public int count() throws IOException, InterruptedException {
-        // TODO: return listNames().size();
-        throw new UnsupportedOperationException("TODO");
+        return listNames().size();
     }
 
     /**
@@ -90,9 +104,22 @@ public final class GcsStore {
      * @throws InterruptedException if an HTTP exchange is interrupted
      */
     public List<Transfer> readAll() throws IOException, InterruptedException {
-        // TODO: for each name in listNames(): GET the object media and
-        // gson.fromJson(body, Transfer.class); collect, sort by seq, return.
-        throw new UnsupportedOperationException("TODO");
+        List<Transfer> transfers = new ArrayList<>();
+        for (String name : listNames()) {
+            String url = API_BASE + bucket + "/o/" + enc(name) + "?alt=media";
+            HttpRequest request = HttpRequest.newBuilder(URI.create(url))
+                    .timeout(HTTP_TIMEOUT)
+                    .header("Authorization", "Bearer " + auth.accessToken())
+                    .GET()
+                    .build();
+            HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString());
+            if (response.statusCode() / 100 != 2) {
+                throw new IOException("GCS fetch of " + name + " returned " + response.statusCode());
+            }
+            transfers.add(gson.fromJson(response.body(), Transfer.class));
+        }
+        transfers.sort(Comparator.comparingLong(Transfer::seq));
+        return transfers;
     }
 
     /**
@@ -104,14 +131,37 @@ public final class GcsStore {
      * @throws InterruptedException if an HTTP exchange is interrupted
      */
     private List<String> listNames() throws IOException, InterruptedException {
-        // TODO: GET API_BASE + bucket + "/o?prefix=" + enc(PREFIX) [+ pageToken];
-        // parse JsonObject, read "items[].name", follow "nextPageToken".
         List<String> names = new ArrayList<>();
-        throw new UnsupportedOperationException("TODO");
+        String pageToken = null;
+        do {
+            String url = API_BASE + bucket + "/o?prefix=" + enc(PREFIX);
+            if (pageToken != null) {
+                url += "&pageToken=" + enc(pageToken);
+            }
+            HttpRequest request = HttpRequest.newBuilder(URI.create(url))
+                    .timeout(HTTP_TIMEOUT)
+                    .header("Authorization", "Bearer " + auth.accessToken())
+                    .GET()
+                    .build();
+            HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString());
+            if (response.statusCode() / 100 != 2) {
+                throw new IOException("GCS list returned " + response.statusCode()
+                        + ": " + response.body());
+            }
+            JsonObject page = gson.fromJson(response.body(), JsonObject.class);
+            JsonArray items = page.getAsJsonArray("items");
+            if (items != null) {
+                for (JsonElement item : items) {
+                    names.add(item.getAsJsonObject().get("name").getAsString());
+                }
+            }
+            pageToken = page.has("nextPageToken") ? page.get("nextPageToken").getAsString() : null;
+        } while (pageToken != null);
+        return names;
     }
 
     /**
-     * Percent-encodes a value for use in a query string.
+     * Percent-encodes a value for use in a query string or object path.
      *
      * @param value the raw value to encode
      * @return the URL-encoded value

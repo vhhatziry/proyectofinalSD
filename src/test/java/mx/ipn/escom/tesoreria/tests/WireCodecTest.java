@@ -2,10 +2,15 @@ package mx.ipn.escom.tesoreria.tests;
 
 import java.util.List;
 
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+
+import mx.ipn.escom.tesoreria.cluster.WireCodec;
+import mx.ipn.escom.tesoreria.core.Transfer;
 import mx.ipn.escom.tesoreria.tests.RunTests.Case;
 
 /**
- * Suite (skeleton) for {@link mx.ipn.escom.tesoreria.cluster.WireCodec}.
+ * Suite for {@link mx.ipn.escom.tesoreria.cluster.WireCodec}.
  *
  * <p>Checks the JSON line format used to replicate commits between the leader
  * and its replicas: a transfer encodes to a single object line, and encoding
@@ -29,21 +34,26 @@ public final class WireCodecTest {
 
     /**
      * Encodes a transfer and asserts the result is a single-line JSON object
-     * carrying the seq, from, to and cents fields. (Skeleton.)
+     * carrying the seq, from, to and cents fields.
      */
     private void encodesOneLine() {
-        // TODO: encode a Transfer and assert the output is one line and a valid
-        // JSON object exposing seq, from, to and cents.
-        throw new UnsupportedOperationException("TODO");
+        Transfer t = new Transfer(1L, 10, 20, 5000L);
+        String line = WireCodec.encode(t);
+        Assert.isTrue("output is a single line", line.indexOf('\n') < 0 && line.indexOf('\r') < 0);
+        JsonObject object = JsonParser.parseString(line).getAsJsonObject();
+        Assert.equals("seq field", 1L, object.get("seq").getAsLong());
+        Assert.equals("from field", 10L, object.get("from").getAsLong());
+        Assert.equals("to field", 20L, object.get("to").getAsLong());
+        Assert.equals("cents field", 5000L, object.get("cents").getAsLong());
     }
 
     /**
      * Decodes the encoding of a transfer and asserts equality with the original,
-     * including large seq and cents values. (Skeleton.)
+     * including large seq and cents values.
      */
     private void roundTrips() {
-        // TODO: assert decode(encode(t)) equals t for a transfer with a large
-        // sequence number and cents amount.
-        throw new UnsupportedOperationException("TODO");
+        Transfer t = new Transfer(9_000_000_000L, 123, 456, 8_000_000_000L);
+        Transfer back = WireCodec.decode(WireCodec.encode(t));
+        Assert.equals("decode(encode(t)) equals t", t, back);
     }
 }
