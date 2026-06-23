@@ -48,6 +48,9 @@ public final class GcsStore {
     /** Per-request ceiling for every Cloud Storage exchange. */
     private static final Duration HTTP_TIMEOUT = Duration.ofSeconds(15);
 
+    /** Attempts per exchange before a transient network failure is fatal. */
+    private static final int MAX_ATTEMPTS = 3;
+
     private final Gson gson = new Gson();
     private final HttpClient http = HttpClient.newHttpClient();
 
@@ -84,7 +87,7 @@ public final class GcsStore {
                 .header("Content-Type", "application/json")
                 .POST(HttpRequest.BodyPublishers.ofString(gson.toJson(transfer)))
                 .build();
-        HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString());
+        HttpResponse<String> response = sendWithRetry(request);
         if (response.statusCode() / 100 != 2) {
             throw new IOException("GCS upload of " + name + " returned "
                     + response.statusCode() + ": " + response.body());
@@ -115,7 +118,7 @@ public final class GcsStore {
                 .header("Content-Type", "application/json")
                 .POST(HttpRequest.BodyPublishers.ofString(gson.toJson(batch)))
                 .build();
-        HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString());
+        HttpResponse<String> response = sendWithRetry(request);
         if (response.statusCode() / 100 != 2) {
             throw new IOException("GCS upload of " + name + " returned "
                     + response.statusCode() + ": " + response.body());
@@ -149,7 +152,7 @@ public final class GcsStore {
                     .header("Authorization", "Bearer " + auth.accessToken())
                     .GET()
                     .build();
-            HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString());
+            HttpResponse<String> response = sendWithRetry(request);
             if (response.statusCode() / 100 != 2) {
                 throw new IOException("GCS fetch of " + name + " returned " + response.statusCode());
             }
@@ -187,7 +190,7 @@ public final class GcsStore {
                     .header("Authorization", "Bearer " + auth.accessToken())
                     .GET()
                     .build();
-            HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString());
+            HttpResponse<String> response = sendWithRetry(request);
             if (response.statusCode() / 100 != 2) {
                 throw new IOException("GCS list returned " + response.statusCode()
                         + ": " + response.body());
@@ -202,6 +205,32 @@ public final class GcsStore {
             pageToken = page.has("nextPageToken") ? page.get("nextPageToken").getAsString() : null;
         } while (pageToken != null);
         return names;
+    }
+
+    /**
+     * Sends a request, retrying a transient network failure up to
+     * {@link #MAX_ATTEMPTS} times before giving up. A non-2xx status is returned
+     * to the caller (each caller decides how to treat it); only an {@link
+     * IOException} (a dropped connection, a timeout) is retried. After the last
+     * attempt the failure is rethrown so cold recovery aborts loudly rather than
+     * silently serving a base-only state.
+     *
+     * @param request the request to send
+     * @return the HTTP response
+     * @throws IOException          if every attempt fails with an I/O error
+     * @throws InterruptedException if the exchange is interrupted
+     */
+    private HttpResponse<String> sendWithRetry(HttpRequest request)
+            throws IOException, InterruptedException {
+        IOException last = null;
+        for (int attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+            try {
+                return http.send(request, HttpResponse.BodyHandlers.ofString());
+            } catch (IOException e) {
+                last = e; // transient; try again
+            }
+        }
+        throw last;
     }
 
     /**
