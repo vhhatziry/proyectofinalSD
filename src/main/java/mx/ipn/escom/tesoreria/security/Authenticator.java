@@ -8,7 +8,7 @@ import mx.ipn.escom.tesoreria.net.Request;
  */
 public final class Authenticator {
 
-    private static final String BEARER_PREFIX = "Bearer ";
+    private static final String SCHEME = "Bearer";
 
     private final CredentialStore store;
     private final Tokens tokens;
@@ -55,17 +55,27 @@ public final class Authenticator {
     }
 
     /**
-     * Authorizes a request by validating its Bearer token.
+     * Authorizes a request by validating its Bearer token. Per RFC 7235 the
+     * auth-scheme is case-insensitive, so {@code "bearer"}, {@code "BEARER"} and
+     * {@code "Bearer"} are all accepted, and any extra whitespace around or
+     * between the scheme and the token is tolerated.
      *
      * @param req the incoming request
      * @return the authenticated subject, or null if the token is missing or invalid
      */
     public String authorize(Request req) {
         String header = req.header("Authorization");
-        if (header == null || !header.startsWith(BEARER_PREFIX)) {
+        if (header == null) {
             return null;
         }
-        String token = header.substring(BEARER_PREFIX.length()).trim();
+        String[] parts = header.trim().split("\\s+", 2);
+        if (parts.length < 2 || !SCHEME.equalsIgnoreCase(parts[0])) {
+            return null;
+        }
+        String token = parts[1].trim();
+        if (token.isEmpty()) {
+            return null;
+        }
         try {
             return tokens.validate(token);
         } catch (RuntimeException e) {
