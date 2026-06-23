@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<!--
+  Tesoreria Distribuida (Equipo 18) - single-page dashboard skeleton.
+  Consumes GET /panel (aggregated stats of this node + peers) and renders one
+  card per node with the contract fields: status, account count, total balance,
+  transfer count, last transaction id, CPU%, RAM%, Disk% and the number of
+  transactions stored in Cloud Storage. Includes a "Refrescar" button and an
+  optional reactive auto-refresh toggle (real-time, worth +1.5 points).
+-->
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Tesoreria Distribuida - Panel</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 1.5rem; }
+    header { display: flex; gap: 1rem; align-items: center; }
+    .nodes { display: flex; flex-wrap: wrap; gap: 1rem; margin-top: 1rem; }
+    .card { border: 1px solid #ccc; border-radius: 8px; padding: 1rem; min-width: 16rem; }
+    .card h2 { margin: 0 0 .5rem; font-size: 1.1rem; }
+    .row { display: flex; justify-content: space-between; padding: .15rem 0; }
+    .label { color: #555; }
+    .up { color: green; }
+    .down { color: red; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Tesoreria Distribuida</h1>
+    <button id="refresh">Refrescar</button>
+    <label><input type="checkbox" id="reactive"> Auto (tiempo real)</label>
+    <span id="updated"></span>
+  </header>
+
+  <section id="nodes" class="nodes">
+    <!-- Node cards are injected here by render(). -->
+  </section>
+
+  <!-- Card template cloned per node by render(). -->
+  <template id="card-template">
+    <article class="card">
+      <h2 data-field="nodeId">nodo-?</h2>
+      <div class="row"><span class="label">Estado</span><span data-field="status">-</span></div>
+      <div class="row"><span class="label">Cuentas</span><span data-field="accountCount">-</span></div>
+      <div class="row"><span class="label">Saldo total</span><span data-field="totalBalance">-</span></div>
+      <div class="row"><span class="label">Transferencias</span><span data-field="transferCount">-</span></div>
+      <div class="row"><span class="label">Ultima tx id</span><span data-field="lastTxId">-</span></div>
+      <div class="row"><span class="label">CPU %</span><span data-field="cpuPercent">-</span></div>
+      <div class="row"><span class="label">RAM %</span><span data-field="ramPercent">-</span></div>
+      <div class="row"><span class="label">Disco %</span><span data-field="diskPercent">-</span></div>
+      <div class="row"><span class="label">Tx en Cloud Storage</span><span data-field="gcsCount">-</span></div>
+    </article>
+  </template>
+
+  <script>
+    "use strict";
+
+    // Poll interval (ms) used when the reactive toggle is enabled.
+    const REACTIVE_INTERVAL_MS = 1500;
+    let timer = null;
+
+    // Fetch the aggregated panel payload: { nodes: [ {nodeId, status, ...} ] }.
+    async function loadPanel() {
+      // TODO: GET /panel, parse JSON, call render(data). Show errors inline.
+      throw new Error("TODO: implement loadPanel()");
+    }
+
+    // Render one card per node into #nodes from the JSON payload.
+    // NOTE: each [data-field] name below must match a JSON key produced by
+    // NodeStats.toJson()/PanelEndpoint (status, accountCount, totalBalance,
+    // transferCount, lastTxId, cpuPercent, ramPercent, diskPercent, gcsCount).
+    function render(data) {
+      // TODO: clear #nodes, clone #card-template per node, fill [data-field]
+      // spans, mark status UP/DOWN, set #updated to the current time.
+      throw new Error("TODO: implement render()");
+    }
+
+    // Start/stop the reactive auto-refresh loop based on the checkbox.
+    function toggleReactive(enabled) {
+      // TODO: when enabled, setInterval(loadPanel, REACTIVE_INTERVAL_MS);
+      // otherwise clearInterval(timer).
+      throw new Error("TODO: implement toggleReactive()");
+    }
+
+    document.getElementById("refresh").addEventListener("click", loadPanel);
+    document.getElementById("reactive").addEventListener("change", (e) => toggleReactive(e.target.checked));
+
+    // Initial draw on page load.
+    loadPanel();
+  </script>
+</body>
+</html>

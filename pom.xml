@@ -1,0 +1,96 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Tesoreria Distribuida - Equipo 18
+  Build descriptor for the distributed mini-bank node.
+
+  Produces a self-contained fat jar via maven-assembly-plugin
+  (jar-with-dependencies), whose entry point is the cluster node
+  bootstrap class mx.ipn.escom.tesoreria.app.Node.
+
+  Allowed dependencies ONLY:
+    - org.mindrot:jbcrypt:0.4        (password hashing)
+    - com.auth0:java-jwt:4.3.0       (JWT issue/validate)
+    - com.google.code.gson:gson:2.13.1 (JSON parsing)
+  No Google Cloud SDK is permitted. GCS is reached through its raw
+  JSON REST API using java.net.http.HttpClient.
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>mx.ipn.escom.tesoreria</groupId>
+    <artifactId>tesoreria-distribuida</artifactId>
+    <version>1.0.0</version>
+    <packaging>jar</packaging>
+
+    <name>Tesoreria Distribuida</name>
+    <description>Distributed mini-bank node (Equipo 18)</description>
+
+    <properties>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <maven.compiler.release>17</maven.compiler.release>
+    </properties>
+
+    <dependencies>
+        <!-- Password hashing (BCrypt). -->
+        <dependency>
+            <groupId>org.mindrot</groupId>
+            <artifactId>jbcrypt</artifactId>
+            <version>0.4</version>
+        </dependency>
+        <!-- JWT issue/validate (HMAC256). -->
+        <dependency>
+            <groupId>com.auth0</groupId>
+            <artifactId>java-jwt</artifactId>
+            <version>4.3.0</version>
+        </dependency>
+        <!-- JSON serialization/parsing. -->
+        <dependency>
+            <groupId>com.google.code.gson</groupId>
+            <artifactId>gson</artifactId>
+            <version>2.13.1</version>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <finalName>tesoreria-distribuida</finalName>
+        <plugins>
+            <!-- Pin the compiler to Java 17 bytecode. -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.13.0</version>
+                <configuration>
+                    <release>17</release>
+                </configuration>
+            </plugin>
+
+            <!-- Build the fat jar with all dependencies bundled. -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-assembly-plugin</artifactId>
+                <version>3.7.1</version>
+                <configuration>
+                    <descriptorRefs>
+                        <descriptorRef>jar-with-dependencies</descriptorRef>
+                    </descriptorRefs>
+                    <archive>
+                        <manifest>
+                            <mainClass>mx.ipn.escom.tesoreria.app.Node</mainClass>
+                        </manifest>
+                    </archive>
+                </configuration>
+                <executions>
+                    <execution>
+                        <id>make-fat-jar</id>
+                        <phase>package</phase>
+                        <goals>
+                            <goal>single</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>

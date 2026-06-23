@@ -1,0 +1,41 @@
+# Tesoreria Distribuida - Equipo 18
+# systemd service unit for a cluster node.
+#
+# Reads the TES_* environment from /etc/tesoreria/node.env (written by
+# startup-script.sh) and launches the fat jar. The HTTP listen port is
+# passed as the first program argument (Node.main args[0], default 8080).
+#
+# SKELETON: structure is real; adjust paths/port if the layout changes.
+
+[Unit]
+Description=Tesoreria Distribuida node (Equipo 18)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tesoreria
+Group=tesoreria
+
+# Per-role TES_* variables (TES_DATASET, TES_JWT_SECRET, TES_LEADER_HOST, ...).
+EnvironmentFile=/etc/tesoreria/node.env
+
+WorkingDirectory=/opt/tesoreria
+
+# TODO: confirm the HTTP port argument (Node.main reads args[0] or defaults 8080).
+ExecStart=/usr/bin/java -jar /opt/tesoreria/tesoreria-distribuida.jar 8080
+
+# Restart on crash so the node rejoins the cluster automatically.
+Restart=on-failure
+RestartSec=5
+
+# TODO: tune resource limits if needed.
+LimitNOFILE=65536
+
+# Basic hardening.
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

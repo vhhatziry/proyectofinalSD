@@ -1,0 +1,14 @@
+# Build
+target/
+*.class
+
+# Credenciales de cuenta de servicio (NUNCA subir al repo)
+credentials.json
+*-key.json
+sa-*.json
+
+# Editor / OS
+.idea/
+*.iml
+.vscode/
+.DS_Store
