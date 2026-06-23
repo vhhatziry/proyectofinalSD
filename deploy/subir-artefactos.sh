@@ -20,11 +20,12 @@ readonly PROJECT_DIR="$(dirname "${SCRIPT_DIR}")"
 
 readonly LOCAL_JAR="${PROJECT_DIR}/target/tesoreria-distribuida-jar-with-dependencies.jar"
 readonly LOCAL_DATASET="${PROJECT_DIR}/material-profesor/alumnos.csv"
+readonly LOCAL_KEY="${PROJECT_DIR}/credentials.json"
 
-# TODO: point these at the project bucket (reference_gcp_proyecto_final).
-readonly GCS_BUCKET="TODO-bucket-name"
+readonly GCS_BUCKET="tesoreria-equipo18-29936158665"
 readonly GCS_JAR_OBJECT="artifacts/tesoreria-distribuida.jar"
 readonly GCS_DATASET_OBJECT="data/alumnos.csv"
+readonly GCS_KEY_OBJECT="secrets/gcs-key.json"
 readonly GCS_DEPLOY_PREFIX="deploy"
 
 log() { echo "[upload] $*"; }
@@ -55,8 +56,19 @@ upload_dataset() {
 
 upload_deploy_assets() {
     log "Uploading deploy assets (node.service) for startup-script.sh"
-    # TODO: startup-script.sh expects node.service alongside the artifacts.
     gsutil cp "${SCRIPT_DIR}/node.service" "gs://${GCS_BUCKET}/${GCS_DEPLOY_PREFIX}/node.service"
+}
+
+upload_key() {
+    # The leader needs the service-account key for the durable GCS journal. It is
+    # gitignored and lives only locally; upload it to a private object. Skipped if
+    # absent (e.g. publishing only the jar/dataset for replicas).
+    if [[ -f "${LOCAL_KEY}" ]]; then
+        log "Uploading GCS service-account key to gs://${GCS_BUCKET}/${GCS_KEY_OBJECT}"
+        gsutil cp "${LOCAL_KEY}" "gs://${GCS_BUCKET}/${GCS_KEY_OBJECT}"
+    else
+        log "WARN: ${LOCAL_KEY} not found; leader will have no durable journal key"
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -67,6 +79,7 @@ main() {
     upload_jar
     upload_dataset
     upload_deploy_assets
+    upload_key
     log "Artifacts published to gs://${GCS_BUCKET}"
 }
 

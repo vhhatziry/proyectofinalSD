@@ -28,11 +28,11 @@ readonly KEYFILE_PATH="${APP_HOME}/gcs-key.json"
 readonly ENV_FILE="/etc/tesoreria/node.env"
 readonly UNIT_PATH="/etc/systemd/system/node.service"
 
-# TODO: point these at the project bucket (reference_gcp_proyecto_final).
-readonly GCS_BUCKET="TODO-bucket-name"
+readonly GCS_BUCKET="tesoreria-equipo18-29936158665"
 readonly GCS_JAR_OBJECT="artifacts/tesoreria-distribuida.jar"
 readonly GCS_DATASET_OBJECT="data/alumnos.csv"
 readonly GCS_KEY_OBJECT="secrets/gcs-key.json"
+readonly GCS_UNIT_OBJECT="deploy/node.service"
 
 log() { echo "[startup] $*"; }
 
@@ -69,11 +69,15 @@ read_metadata() {
 }
 
 download_artifacts() {
-    log "Downloading jar, dataset and GCS key from gs://${GCS_BUCKET}"
-    # TODO: gsutil is available via the gcloud SDK on Google images; otherwise
-    #       authenticate against the GCS JSON API. Prefer gsutil here for the boot.
+    log "Downloading jar, dataset, unit and GCS key from gs://${GCS_BUCKET}"
+    # gsutil ships on Google Cloud public images (Debian 12). Fail clearly if the
+    # chosen image lacks it rather than booting into a broken half-install.
+    command -v gsutil >/dev/null 2>&1 || { log "ERROR: gsutil not found; use a Google Cloud image"; exit 1; }
     gsutil cp "gs://${GCS_BUCKET}/${GCS_JAR_OBJECT}" "${JAR_PATH}"
     gsutil cp "gs://${GCS_BUCKET}/${GCS_DATASET_OBJECT}" "${DATASET_PATH}"
+    # The systemd unit ships alongside the artifacts; install_service() expects it
+    # at ${APP_HOME}/node.service, so it must be fetched here.
+    gsutil cp "gs://${GCS_BUCKET}/${GCS_UNIT_OBJECT}" "${APP_HOME}/node.service"
     gsutil cp "gs://${GCS_BUCKET}/${GCS_KEY_OBJECT}" "${KEYFILE_PATH}" || \
         log "WARN: GCS key not downloaded (replica nodes may not need it)"
     chown -R "${APP_USER}:${APP_USER}" "${APP_HOME}"
@@ -117,12 +121,12 @@ EOF
 # ---------------------------------------------------------------------------
 install_service() {
     log "Installing systemd unit and starting node.service"
-    # TODO: ship node.service alongside this script (same deploy/ dir) and
-    #       copy it in; here we assume it is fetched next to the startup script.
+    # node.service was fetched by download_artifacts() into ${APP_HOME}.
     if [[ -f "${APP_HOME}/node.service" ]]; then
         cp "${APP_HOME}/node.service" "${UNIT_PATH}"
     else
-        log "WARN: node.service not present at ${APP_HOME}; install it manually"
+        log "ERROR: node.service not present at ${APP_HOME}; cannot start node"
+        exit 1
     fi
     systemctl daemon-reload
     systemctl enable node.service
