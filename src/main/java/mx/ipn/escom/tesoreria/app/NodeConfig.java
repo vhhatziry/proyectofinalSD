@@ -20,6 +20,9 @@ public final class NodeConfig {
     /** Default worker pool size when TES_WORKERS is unset. */
     public static final int DEFAULT_WORKERS = 16;
 
+    /** Default id of the first account when TES_ID_BASE is unset. */
+    public static final int DEFAULT_ID_BASE = 1;
+
     private final String datasetPath;
     private final String jwtSecret;
     private final String nodeId;
@@ -29,10 +32,11 @@ public final class NodeConfig {
     private final String bucket;
     private final String gcsKeyfile;
     private final int workers;
+    private final int idBase;
 
     private NodeConfig(String datasetPath, String jwtSecret, String nodeId,
                        String peers, String leaderHost, int replPort,
-                       String bucket, String gcsKeyfile, int workers) {
+                       String bucket, String gcsKeyfile, int workers, int idBase) {
         this.datasetPath = datasetPath;
         this.jwtSecret = jwtSecret;
         this.nodeId = nodeId;
@@ -42,6 +46,7 @@ public final class NodeConfig {
         this.bucket = bucket;
         this.gcsKeyfile = gcsKeyfile;
         this.workers = workers;
+        this.idBase = idBase;
     }
 
     /**
@@ -60,7 +65,8 @@ public final class NodeConfig {
                 intEnv("TES_REPL_PORT", DEFAULT_REPL_PORT),
                 env("TES_BUCKET", null),
                 env("TES_GCS_KEYFILE", null),
-                intEnv("TES_WORKERS", DEFAULT_WORKERS));
+                intEnv("TES_WORKERS", DEFAULT_WORKERS),
+                intEnv("TES_ID_BASE", DEFAULT_ID_BASE));
     }
 
     /** Reads an environment variable, returning {@code def} when unset or empty. */
@@ -125,6 +131,15 @@ public final class NodeConfig {
     /** Size of the request worker thread pool (TES_WORKERS, default 16). */
     public int workers() {
         return workers;
+    }
+
+    /**
+     * Id assigned to the first account in the dataset (TES_ID_BASE, default 1).
+     * Configurable so the convention can be re-based to match the contest load
+     * generator without recompiling.
+     */
+    public int idBase() {
+        return idBase;
     }
 
     /**

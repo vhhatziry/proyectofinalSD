@@ -59,9 +59,17 @@ public final class Node {
         NodeConfig config = NodeConfig.fromEnv();
 
         // Load the shared accounts dataset into a brand-new in-memory ledger,
-        // then wrap it in the bank that orchestrates transfers and commits.
+        // then wrap it in the bank that orchestrates transfers and commits. A
+        // load that yields no accounts means a missing or truncated CSV (e.g. a
+        // failed boot-time copy from Cloud Storage); fail fast rather than serve a
+        // wrong account count and a broken conservation total.
         Ledger ledger = new Ledger();
-        Dataset.loadInto(ledger, Path.of(config.datasetPath()));
+        int loaded = Dataset.loadInto(ledger, Path.of(config.datasetPath()), config.idBase());
+        if (loaded <= 0) {
+            throw new IllegalStateException("dataset loaded 0 accounts from "
+                    + config.datasetPath() + "; refusing to start with an empty ledger");
+        }
+        System.out.println("[node] loaded " + loaded + " accounts from " + config.datasetPath());
         Bank bank = new Bank(ledger);
 
         Journal journal = null;
@@ -77,6 +85,12 @@ public final class Node {
                 int recovered = journal.recover(bank::applyReplicated);
                 journal.start(recovered);
                 bank.addCommitListener(journal);
+                System.out.println("[node] recovered " + recovered
+                        + " transfers from the GCS journal; resuming at sequence " + bank.lastSeq());
+                // Drain the durable queue on a graceful stop so an orderly restart
+                // recovers the complete log.
+                final Journal toDrain = journal;
+                Runtime.getRuntime().addShutdownHook(new Thread(toDrain::stop, "journal-drain"));
             }
 
             ReplicaFeed feed = new ReplicaFeed(config.replPort(), bank.log());
