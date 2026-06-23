@@ -94,7 +94,12 @@ public final class PanelEndpoint implements Endpoint {
         return Reply.json(200, nodes.toString());
     }
 
-    /** Splits TES_PEERS into trimmed, non-empty base URLs. */
+    /**
+     * Splits TES_PEERS into trimmed, non-empty base URLs, tolerating entries
+     * written as bare {@code host:port} by prefixing {@code http://}. This keeps
+     * the dashboard working whether the deploy metadata lists peers with or
+     * without a scheme.
+     */
     private String[] peerBaseUrls() {
         String raw = config.peers();
         if (raw == null || raw.isBlank()) {
@@ -103,9 +108,14 @@ public final class PanelEndpoint implements Endpoint {
         String[] parts = raw.split(",");
         int count = 0;
         for (String part : parts) {
-            if (!part.trim().isEmpty()) {
-                parts[count++] = part.trim();
+            String peer = part.trim();
+            if (peer.isEmpty()) {
+                continue;
             }
+            if (!peer.startsWith("http://") && !peer.startsWith("https://")) {
+                peer = "http://" + peer;
+            }
+            parts[count++] = peer;
         }
         String[] result = new String[count];
         System.arraycopy(parts, 0, result, 0, count);
