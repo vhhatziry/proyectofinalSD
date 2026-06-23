@@ -70,14 +70,21 @@ public final class BalanceEndpoint implements Endpoint {
         if (auth.authorize(req) == null) {
             return Reply.status(401);
         }
+        String raw = req.pathParam("id");
+        if (raw == null || !raw.trim().matches("-?\\d+")) {
+            // Non-numeric path id is a malformed request.
+            return Reply.json(400, "{\"error\":\"bad_id\"}");
+        }
         int id;
         try {
-            id = Integer.parseInt(req.pathParam("id").trim());
-        } catch (RuntimeException e) {
-            return Reply.json(400, "{\"error\":\"bad_id\"}");
+            id = Integer.parseInt(raw.trim());
+        } catch (NumberFormatException e) {
+            // Numeric but beyond the int range: no account can carry this id.
+            return Reply.status(404);
         }
         Account account = ledger.get(id);
         if (account == null) {
+            // Numeric, in range, but not registered (includes negative and zero).
             return Reply.status(404);
         }
         long cents = account.balanceCents();

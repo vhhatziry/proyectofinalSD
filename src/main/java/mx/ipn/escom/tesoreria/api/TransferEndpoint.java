@@ -72,16 +72,26 @@ public final class TransferEndpoint implements Endpoint {
         if (auth.authorize(req) == null) {
             return Reply.status(401);
         }
-        int from;
-        int to;
+        String srcRaw;
+        String dstRaw;
         long cents;
         try {
             JsonObject body = gson.fromJson(req.bodyText(), JsonObject.class);
-            from = Integer.parseInt(body.get(KEY_SOURCE).getAsString().trim());
-            to = Integer.parseInt(body.get(KEY_TARGET).getAsString().trim());
+            srcRaw = body.get(KEY_SOURCE).getAsString().trim();
+            dstRaw = body.get(KEY_TARGET).getAsString().trim();
             cents = Money.toCents(body.get(KEY_AMOUNT).getAsString());
         } catch (RuntimeException e) {
             return Reply.json(400, "{\"error\":\"bad_request\"}");
+        }
+        if (!srcRaw.matches("-?\\d+") || !dstRaw.matches("-?\\d+")) {
+            // Non-numeric account id is a malformed body.
+            return Reply.json(400, "{\"error\":\"bad_request\"}");
+        }
+        Integer from = parseAccountId(srcRaw);
+        Integer to = parseAccountId(dstRaw);
+        if (from == null || to == null) {
+            // Numeric but beyond the int range: no such account.
+            return Reply.json(404, "{\"error\":\"no_such_account\"}");
         }
         try {
             long seq = bank.transfer(from, to, cents);
@@ -94,6 +104,21 @@ public final class TransferEndpoint implements Endpoint {
             JsonObject err = new JsonObject();
             err.addProperty("error", e.code());
             return Reply.json(status, gson.toJson(err));
+        }
+    }
+
+    /**
+     * Parses an all-digits account id, returning {@code null} when it is numeric
+     * but outside the int range (so it cannot name any account).
+     *
+     * @param numeric a string already known to match {@code -?\d+}
+     * @return the id, or {@code null} on overflow
+     */
+    private static Integer parseAccountId(String numeric) {
+        try {
+            return Integer.parseInt(numeric);
+        } catch (NumberFormatException e) {
+            return null;
         }
     }
 }
