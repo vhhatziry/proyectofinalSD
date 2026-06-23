@@ -210,35 +210,28 @@ public final class LoadDriver {
         return true;
     }
 
-    /**
-     * Picks a small positive transfer amount as a two-decimal string, between
-     * 0.01 and 100.00, kept low so transfers rarely exhaust an account.
-     *
-     * @return a decimal amount such as {@code "37.50"}
-     */
+    /** A small two-decimal amount in [0.01, 100.00], low so transfers rarely exhaust an account. */
     String randomAmount() {
         long cents = ThreadLocalRandom.current().nextLong(1, 10001);
         return BigDecimal.valueOf(cents).movePointLeft(2).setScale(2).toPlainString();
     }
 
     /**
-     * Reads every account in the configured range and returns the summed
-     * balance in cents. Used both for the baseline snapshot and the final
-     * verification pass.
+     * Returns the full-bank total balance in cents, read in one request from
+     * {@code GET /api/stats} (the server sums all 820k accounts in memory). This
+     * is the true conservation total the contract verifies, and it is O(1) on the
+     * client instead of summing hundreds of thousands of balances over HTTP.
      *
-     * @return total balance across the account range, in cents
+     * @return total balance across every account, in cents
      */
     long captureTotalCents() {
-        HttpClient http = newClient();
-        long total = 0L;
-        for (int id = minAccountId; id <= maxAccountId; id++) {
-            HttpRequest request = authorized("/api/accounts/" + id).GET().build();
-            String body = send(http, request, 200);
-            if (body != null) {
-                total += parseBalanceCents(body);
-            }
+        HttpRequest request = HttpRequest.newBuilder(URI.create(baseUrl + "/api/stats"))
+                .timeout(Duration.ofSeconds(10)).GET().build();
+        String body = send(newClient(), request, 200);
+        if (body == null) {
+            throw new IllegalStateException("could not read /api/stats for the invariant snapshot");
         }
-        return total;
+        return toCents(gson.fromJson(body, JsonObject.class).get("totalBalance").getAsString());
     }
 
     /**
@@ -288,21 +281,12 @@ public final class LoadDriver {
                 + (actualCents - expectedCents) + " cent gap is spread across the range");
     }
 
-    /**
-     * Picks a uniformly random account id inside the configured range.
-     *
-     * @return an account id in {@code [minAccountId, maxAccountId]}
-     */
+    /** A uniformly random account id in {@code [minAccountId, maxAccountId]}. */
     int randomAccountId() {
         return ThreadLocalRandom.current().nextInt(minAccountId, maxAccountId + 1);
     }
 
-    /**
-     * Builds a fresh per-thread {@link HttpClient}. Each worker owns its own
-     * client so that connection pools do not become a shared bottleneck.
-     *
-     * @return a configured HTTP/1.1 client with a connect timeout
-     */
+    /** A fresh per-thread HTTP/1.1 client (own client so pools are not a shared bottleneck). */
     static HttpClient newClient() {
         return HttpClient.newBuilder()
                 .version(HttpClient.Version.HTTP_1_1)
@@ -310,23 +294,13 @@ public final class LoadDriver {
                 .build();
     }
 
-    /**
-     * Converts a decimal money string (as returned by the API) to cents.
-     *
-     * @param decimal a balance such as {@code "15750.25"}
-     * @return the value in cents (e.g. {@code 1575025})
-     */
+    /** Converts a decimal money string such as {@code "15750.25"} to cents (1575025). */
     static long toCents(String decimal) {
         return new BigDecimal(decimal).movePointRight(2)
                 .setScale(0, RoundingMode.HALF_UP).longValueExact();
     }
 
-    /**
-     * Extracts the {@code balance} field from an account JSON document.
-     *
-     * @param json the body of {@code GET /api/accounts/{id}}
-     * @return the balance in cents
-     */
+    /** Extracts the {@code balance} field (in cents) from an account JSON document. */
     long parseBalanceCents(String json) {
         JsonObject obj = gson.fromJson(json, JsonObject.class);
         return toCents(obj.get("balance").getAsString());
