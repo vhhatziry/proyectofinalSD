@@ -40,9 +40,24 @@ public final class LoginEndpoint implements Endpoint {
      */
     @Override
     public Reply serve(Request req) {
-        // TODO: enforce POST (405 otherwise), parse {username,password} with gson,
-        // call auth.login(username, password); on a non-null token return 200 with
-        // {"token":token}, otherwise return 401.
-        throw new UnsupportedOperationException("TODO");
+        if (!"POST".equals(req.method())) {
+            return Reply.status(405);
+        }
+        String username;
+        String password;
+        try {
+            JsonObject body = gson.fromJson(req.bodyText(), JsonObject.class);
+            username = body.get("username").getAsString();
+            password = body.get("password").getAsString();
+        } catch (RuntimeException e) {
+            return Reply.json(400, "{\"error\":\"bad_request\"}");
+        }
+        String token = auth.login(username, password);
+        if (token == null) {
+            return Reply.json(401, "{\"error\":\"invalid_credentials\"}");
+        }
+        JsonObject out = new JsonObject();
+        out.addProperty("token", token);
+        return Reply.json(200, gson.toJson(out));
     }
 }

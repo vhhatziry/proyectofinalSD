@@ -40,9 +40,24 @@ public final class RegisterEndpoint implements Endpoint {
      */
     @Override
     public Reply serve(Request req) {
-        // TODO: enforce POST (405 otherwise), parse {username,password} with gson,
-        // reject blank fields (400), call auth.signup(username, password),
-        // return 201 on success or 409 when the username already exists.
-        throw new UnsupportedOperationException("TODO");
+        if (!"POST".equals(req.method())) {
+            return Reply.status(405);
+        }
+        String username;
+        String password;
+        try {
+            JsonObject body = gson.fromJson(req.bodyText(), JsonObject.class);
+            username = body.get("username").getAsString();
+            password = body.get("password").getAsString();
+        } catch (RuntimeException e) {
+            return Reply.json(400, "{\"error\":\"bad_request\"}");
+        }
+        if (username.isBlank() || password.isBlank()) {
+            return Reply.json(400, "{\"error\":\"bad_request\"}");
+        }
+        if (auth.signup(username, password)) {
+            return Reply.json(201, "{\"status\":\"created\"}");
+        }
+        return Reply.json(409, "{\"error\":\"username_taken\"}");
     }
 }

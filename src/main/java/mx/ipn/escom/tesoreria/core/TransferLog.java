@@ -1,5 +1,6 @@
 package mx.ipn.escom.tesoreria.core;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 
@@ -34,8 +35,13 @@ public final class TransferLog {
      * @return the matching transfers
      */
     public List<Transfer> since(long seq) {
-        // TODO: filter entries with t.seq() > seq, preserving order.
-        throw new UnsupportedOperationException("TODO");
+        List<Transfer> result = new ArrayList<>();
+        for (Transfer t : entries) {
+            if (t.seq() > seq) {
+                result.add(t);
+            }
+        }
+        return result;
     }
 
     /**

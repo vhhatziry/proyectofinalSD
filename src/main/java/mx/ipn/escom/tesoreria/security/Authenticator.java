@@ -32,8 +32,8 @@ public final class Authenticator {
      * @return true if registered, false if the username was taken
      */
     public boolean signup(String username, String password) {
-        // TODO: hash with Passwords.encode and delegate to store.register
-        throw new UnsupportedOperationException("TODO");
+        String hash = Passwords.encode(password);
+        return store.register(username, hash);
     }
 
     /**
@@ -44,8 +44,14 @@ public final class Authenticator {
      * @return a signed JWT if the credentials match, otherwise null
      */
     public String login(String username, String password) {
-        // TODO: find credential, verify with Passwords.matches, issue token via tokens.issue
-        throw new UnsupportedOperationException("TODO");
+        Credential credential = store.find(username);
+        if (credential == null) {
+            return null;
+        }
+        if (!Passwords.matches(password, credential.passwordHash())) {
+            return null;
+        }
+        return tokens.issue(username);
     }
 
     /**
@@ -55,7 +61,15 @@ public final class Authenticator {
      * @return the authenticated subject, or null if the token is missing or invalid
      */
     public String authorize(Request req) {
-        // TODO: read "Authorization" header, strip BEARER_PREFIX, tokens.validate; return null on failure
-        throw new UnsupportedOperationException("TODO");
+        String header = req.header("Authorization");
+        if (header == null || !header.startsWith(BEARER_PREFIX)) {
+            return null;
+        }
+        String token = header.substring(BEARER_PREFIX.length()).trim();
+        try {
+            return tokens.validate(token);
+        } catch (RuntimeException e) {
+            return null;
+        }
     }
 }

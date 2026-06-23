@@ -66,15 +66,34 @@ public final class TransferEndpoint implements Endpoint {
      */
     @Override
     public Reply serve(Request req) {
-        // TODO: enforce POST (405 otherwise); call auth.authorize(req) and return 401
-        // when it fails; parse {sourceAccountId,targetAccountId,amount} with gson,
-        // reading the ids as strings (400 if blank/non-numeric) and converting amount
-        // with Money.toCents (400 if malformed); then
-        //   try { long seq = bank.transfer(from, to, cents);
-        //         return Reply.json(200, {"status":"ok","seq":seq}); }
-        //   catch (TransferException e) {
-        //         int status = "no_such_account".equals(e.code()) ? 404 : 400;
-        //         return Reply.json(status, {"error": e.code()}); }
-        throw new UnsupportedOperationException("TODO");
+        if (!"POST".equals(req.method())) {
+            return Reply.status(405);
+        }
+        if (auth.authorize(req) == null) {
+            return Reply.status(401);
+        }
+        int from;
+        int to;
+        long cents;
+        try {
+            JsonObject body = gson.fromJson(req.bodyText(), JsonObject.class);
+            from = Integer.parseInt(body.get(KEY_SOURCE).getAsString().trim());
+            to = Integer.parseInt(body.get(KEY_TARGET).getAsString().trim());
+            cents = Money.toCents(body.get(KEY_AMOUNT).getAsString());
+        } catch (RuntimeException e) {
+            return Reply.json(400, "{\"error\":\"bad_request\"}");
+        }
+        try {
+            long seq = bank.transfer(from, to, cents);
+            JsonObject ok = new JsonObject();
+            ok.addProperty("status", "ok");
+            ok.addProperty("seq", Long.valueOf(seq));
+            return Reply.json(200, gson.toJson(ok));
+        } catch (TransferException e) {
+            int status = "no_such_account".equals(e.code()) ? 404 : 400;
+            JsonObject err = new JsonObject();
+            err.addProperty("error", e.code());
+            return Reply.json(status, gson.toJson(err));
+        }
     }
 }

@@ -56,8 +56,8 @@ public final class Request {
 
     /** First value of the named header, case-insensitive, or null if absent. */
     public String header(String name) {
-        // TODO: lookup by name.toLowerCase() in the headers map.
-        throw new UnsupportedOperationException("TODO");
+        List<String> values = headers.get(name.toLowerCase());
+        return (values == null || values.isEmpty()) ? null : values.get(0);
     }
 
     /** Raw request body bytes (never null; empty array when no body). */

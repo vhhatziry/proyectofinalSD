@@ -56,10 +56,16 @@ public final class Bank {
             throw TransferException.badAmount();
         }
 
-        // TODO: ledger.move(from, to, cents); on success assign seq =
-        // sequence.incrementAndGet(), build Transfer(seq, from, to, cents),
-        // log.append(it), bump applied and lastSeq, notify listeners, return seq.
-        throw new UnsupportedOperationException("TODO");
+        ledger.move(from, to, cents);
+        long seq = sequence.incrementAndGet();
+        Transfer committed = new Transfer(seq, from, to, cents);
+        log.append(committed);
+        applied.incrementAndGet();
+        lastSeq = seq;
+        for (CommitListener listener : listeners) {
+            listener.onCommit(committed);
+        }
+        return seq;
     }
 
     /**
@@ -72,13 +78,24 @@ public final class Bank {
      * never advances past what has actually been seen.
      */
     public void applyReplicated(Transfer t) {
-        // TODO: try { ledger.move(t.from(), t.to(), t.cents()); } catch
-        // (TransferException e) { ignore only when e.code() is "no_such_account",
-        // otherwise rethrow as unchecked or log }. Then log.append(t), bump
-        // applied. Raise the counter with:
-        //   synchronized (this) { if (t.seq() > lastSeq) lastSeq = t.seq(); }
-        // (do NOT use accumulateAndGet(Math::max)).
-        throw new UnsupportedOperationException("TODO");
+        try {
+            ledger.move(t.from(), t.to(), t.cents());
+        } catch (TransferException e) {
+            // A follower may not have materialized every account; tolerate only
+            // that case so catch-up never stalls. Anything else is unexpected on
+            // a follower but must still not break the replication stream.
+            if (!"no_such_account".equals(e.code())) {
+                System.err.println("applyReplicated: unexpected " + e.code()
+                        + " for seq " + t.seq());
+            }
+        }
+        log.append(t);
+        applied.incrementAndGet();
+        synchronized (this) {
+            if (t.seq() > lastSeq) {
+                lastSeq = t.seq();
+            }
+        }
     }
 
     /** Highest sequence number handed out so far on this node. */

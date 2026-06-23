@@ -64,14 +64,29 @@ public final class BalanceEndpoint implements Endpoint {
      */
     @Override
     public Reply serve(Request req) {
-        // TODO: enforce GET (405 otherwise); call auth.authorize(req) and return 401
-        // when it fails; parse req.pathParam("id") to int (400 if not numeric);
-        // look the Account up in the ledger (404 if absent); build a JsonObject with
-        // keys id (number), propietario (string) and balance (number). Read
-        // balanceCents under the Account monitor, then add balance via the Number
-        // overload, e.g. body.addProperty("balance", new BigDecimal(
-        // Money.toDecimal(cents))), so gson emits 15750.25 unquoted (NOT "15750.25").
-        // Add id with addProperty(String, Number) too. Return 200 with the body.
-        throw new UnsupportedOperationException("TODO");
+        if (!"GET".equals(req.method())) {
+            return Reply.status(405);
+        }
+        if (auth.authorize(req) == null) {
+            return Reply.status(401);
+        }
+        int id;
+        try {
+            id = Integer.parseInt(req.pathParam("id").trim());
+        } catch (RuntimeException e) {
+            return Reply.json(400, "{\"error\":\"bad_id\"}");
+        }
+        Account account = ledger.get(id);
+        if (account == null) {
+            return Reply.status(404);
+        }
+        long cents = account.balanceCents();
+
+        JsonObject body = new JsonObject();
+        body.addProperty(KEY_ID, Integer.valueOf(id));
+        body.addProperty(KEY_OWNER, account.owner());
+        // Wrap in BigDecimal so gson emits the balance as an unquoted JSON number.
+        body.addProperty(KEY_BALANCE, new BigDecimal(Money.toDecimal(cents)));
+        return Reply.json(200, gson.toJson(body));
     }
 }

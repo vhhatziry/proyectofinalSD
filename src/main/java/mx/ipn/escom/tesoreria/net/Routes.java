@@ -54,8 +54,7 @@ public final class Routes {
      * most one {name} variable segment (for example /api/balance/{id}).
      */
     public void register(String method, String pattern, Endpoint endpoint) {
-        // TODO: normalize method to upper-case, split pattern by '/', store Route.
-        throw new UnsupportedOperationException("TODO");
+        routes.add(new Route(method.toUpperCase(), splitSegments(pattern), endpoint));
     }
 
     /**
@@ -64,11 +63,52 @@ public final class Routes {
      * 200/404/405 semantics.
      */
     public Match match(String method, String path) {
-        // TODO: split path into segments; find routes whose segment shape
-        // matches by equality (with {name} matching any single segment);
-        // if a shape matches but the method differs -> 405; if a method+shape
-        // matches -> 200 with captured params; otherwise -> 404.
-        throw new UnsupportedOperationException("TODO");
+        String wanted = method.toUpperCase();
+        String[] segments = splitSegments(path);
+        boolean pathMatchedButMethod = false;
+
+        for (Route route : routes) {
+            if (route.segments.length != segments.length) {
+                continue;
+            }
+            Map<String, String> params = new HashMap<>();
+            boolean shapeMatches = true;
+            for (int i = 0; i < segments.length; i++) {
+                String pat = route.segments[i];
+                if (isVariable(pat)) {
+                    params.put(pat.substring(1, pat.length() - 1), segments[i]);
+                } else if (!pat.equals(segments[i])) {
+                    shapeMatches = false;
+                    break;
+                }
+            }
+            if (!shapeMatches) {
+                continue;
+            }
+            if (route.method.equals(wanted)) {
+                return new Match(200, route.endpoint, params);
+            }
+            pathMatchedButMethod = true;
+        }
+        return pathMatchedButMethod ? methodNotAllowed() : notFound();
+    }
+
+    /** True when a pattern segment is a {name} route variable. */
+    private static boolean isVariable(String segment) {
+        return segment.length() > 1
+                && segment.charAt(0) == '{'
+                && segment.charAt(segment.length() - 1) == '}';
+    }
+
+    /** Splits a path or pattern into its non-empty '/'-separated segments. */
+    private static String[] splitSegments(String path) {
+        List<String> segments = new ArrayList<>();
+        for (String part : path.split("/")) {
+            if (!part.isEmpty()) {
+                segments.add(part);
+            }
+        }
+        return segments.toArray(new String[0]);
     }
 
     /** Convenience holder for a not-found result. */

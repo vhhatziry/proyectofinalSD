@@ -57,13 +57,94 @@ public final class RequestParser {
      * to a following pipelined request stay in the supplied buffer.
      */
     public boolean feed(ByteBuffer in) {
-        // TODO: loop over the states:
-        //   READ_LINE    -> accumulate until CRLF, then parse method/path/query/version.
-        //   READ_HEADERS -> accumulate header lines until a blank CRLF line;
-        //                   compute remainingBody from Content-Length (0 if absent).
-        //   READ_BODY    -> drain up to remainingBody bytes into bodyBuf.
-        //   DONE         -> build the Request, store it, return true.
-        throw new UnsupportedOperationException("TODO");
+        while (state != State.DONE && in.hasRemaining()) {
+            if (state == State.READ_BODY) {
+                int n = Math.min(remainingBody, in.remaining());
+                for (int i = 0; i < n; i++) {
+                    bodyBuf.write(in.get());
+                }
+                remainingBody -= n;
+                if (remainingBody == 0) {
+                    buildRequest();
+                }
+                continue;
+            }
+            // READ_LINE / READ_HEADERS both accumulate a CRLF-terminated line.
+            byte b = in.get();
+            if (b == '\n') {
+                String line = takeLine();
+                if (state == State.READ_LINE) {
+                    parseRequestLine(line);
+                    state = State.READ_HEADERS;
+                } else if (line.isEmpty()) {
+                    remainingBody = contentLength();
+                    if (remainingBody > 0) {
+                        state = State.READ_BODY;
+                    } else {
+                        buildRequest();
+                    }
+                } else {
+                    parseHeader(line);
+                }
+            } else {
+                lineBuf.write(b);
+            }
+        }
+        return state == State.DONE;
+    }
+
+    /** Returns the accumulated line (without the trailing CR) and clears the buffer. */
+    private String takeLine() {
+        String raw = lineBuf.toString(java.nio.charset.StandardCharsets.US_ASCII);
+        lineBuf.reset();
+        if (raw.endsWith("\r")) {
+            raw = raw.substring(0, raw.length() - 1);
+        }
+        return raw;
+    }
+
+    /** Parses "METHOD target HTTP/x.y", splitting the target into path and query. */
+    private void parseRequestLine(String line) {
+        String[] parts = line.split(" ");
+        method = (parts.length > 0) ? parts[0].toUpperCase() : "GET";
+        String target = (parts.length > 1) ? parts[1] : "/";
+        version = (parts.length > 2) ? parts[2] : "HTTP/1.0";
+        int q = target.indexOf('?');
+        if (q >= 0) {
+            path = target.substring(0, q);
+            query = target.substring(q + 1);
+        } else {
+            path = target;
+            query = "";
+        }
+    }
+
+    /** Splits a header line at the first colon and records the lowercased name. */
+    private void parseHeader(String line) {
+        int colon = line.indexOf(':');
+        if (colon > 0) {
+            addHeader(line.substring(0, colon).trim(), line.substring(colon + 1).trim());
+        }
+    }
+
+    /** Content-Length as an int, or 0 when absent or malformed. */
+    private int contentLength() {
+        List<String> values = headers.get("content-length");
+        if (values == null || values.isEmpty()) {
+            return 0;
+        }
+        try {
+            return Math.max(0, Integer.parseInt(values.get(0).trim()));
+        } catch (NumberFormatException e) {
+            return 0;
+        }
+    }
+
+    /** Materializes the parsed pieces into an immutable Request and marks DONE. */
+    private void buildRequest() {
+        completed = new Request(method, path, query,
+                new HashMap<>(headers), bodyBuf.toByteArray(), computeKeepAlive());
+        state = State.DONE;
     }
 
     /** True once feed() has assembled a full request not yet taken. */
@@ -76,8 +157,12 @@ public final class RequestParser {
      * on this connection. Returns null if no request is ready.
      */
     public Request take() {
-        // TODO: return completed, then call reset() for the next pipelined request.
-        throw new UnsupportedOperationException("TODO");
+        if (completed == null) {
+            return null;
+        }
+        Request ready = completed;
+        reset();
+        return ready;
     }
 
     /** Clears all per-request state so the same instance can parse the next. */
@@ -96,9 +181,19 @@ public final class RequestParser {
 
     /** Decides keep-alive from version and the Connection header. */
     private boolean computeKeepAlive() {
-        // TODO: HTTP/1.1 defaults to keep-alive unless Connection: close;
-        // HTTP/1.0 needs Connection: keep-alive.
-        return true;
+        List<String> connection = headers.get("connection");
+        String value = (connection == null || connection.isEmpty())
+                ? null : connection.get(0).trim();
+        if (value != null) {
+            if (value.equalsIgnoreCase("close")) {
+                return false;
+            }
+            if (value.equalsIgnoreCase("keep-alive")) {
+                return true;
+            }
+        }
+        // No explicit token: HTTP/1.1 keeps the connection alive, older does not.
+        return "HTTP/1.1".equalsIgnoreCase(version);
     }
 
     /** Placeholder for accumulating a parsed header value. */

@@ -51,8 +51,35 @@ public final class NodeConfig {
      * @return a populated configuration instance
      */
     public static NodeConfig fromEnv() {
-        // TODO: read each TES_* variable via System.getenv and apply defaults.
-        throw new UnsupportedOperationException("TODO");
+        return new NodeConfig(
+                env("TES_DATASET", null),
+                env("TES_JWT_SECRET", null),
+                env("TES_NODE_ID", null),
+                env("TES_PEERS", ""),
+                env("TES_LEADER_HOST", ""),
+                intEnv("TES_REPL_PORT", DEFAULT_REPL_PORT),
+                env("TES_BUCKET", null),
+                env("TES_GCS_KEYFILE", null),
+                intEnv("TES_WORKERS", DEFAULT_WORKERS));
+    }
+
+    /** Reads an environment variable, returning {@code def} when unset or empty. */
+    private static String env(String name, String def) {
+        String value = System.getenv(name);
+        return (value == null || value.isEmpty()) ? def : value;
+    }
+
+    /** Reads an integer environment variable, falling back to {@code def}. */
+    private static int intEnv(String name, int def) {
+        String value = System.getenv(name);
+        if (value == null || value.isBlank()) {
+            return def;
+        }
+        try {
+            return Integer.parseInt(value.trim());
+        } catch (NumberFormatException e) {
+            return def;
+        }
     }
 
     /** Path to the accounts CSV dataset (TES_DATASET). */

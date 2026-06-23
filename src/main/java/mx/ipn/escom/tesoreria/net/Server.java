@@ -1,6 +1,8 @@
 package mx.ipn.escom.tesoreria.net;
 
 import java.io.IOException;
+import java.net.InetSocketAddress;
+import java.nio.channels.SelectionKey;
 import java.nio.channels.Selector;
 import java.nio.channels.ServerSocketChannel;
 import java.util.concurrent.ExecutorService;
@@ -42,10 +44,18 @@ public final class Server {
      * pool, and starts the IoLoop. Idempotent guarding via the started flag.
      */
     public void start() throws IOException {
-        // TODO: open ServerSocketChannel (non-blocking), bind configuredPort,
-        // open Selector, register OP_ACCEPT, create the worker ExecutorService,
-        // build and start the IoLoop, set started = true.
-        throw new UnsupportedOperationException("TODO");
+        if (started) {
+            return;
+        }
+        serverChannel = ServerSocketChannel.open();
+        serverChannel.configureBlocking(false);
+        serverChannel.bind(new InetSocketAddress(configuredPort));
+        selector = Selector.open();
+        serverChannel.register(selector, SelectionKey.OP_ACCEPT);
+        workers = Executors.newFixedThreadPool(workerCount);
+        ioLoop = new IoLoop(selector, serverChannel, routes, workers, READ_BUFFER_SIZE);
+        ioLoop.start();
+        started = true;
     }
 
     /**
@@ -53,19 +63,42 @@ public final class Server {
      * pick an ephemeral port (handy for tests).
      */
     public int port() {
-        // TODO: return the bound local port from the server socket.
-        throw new UnsupportedOperationException("TODO");
+        if (serverChannel == null) {
+            return configuredPort;
+        }
+        try {
+            return ((InetSocketAddress) serverChannel.getLocalAddress()).getPort();
+        } catch (IOException e) {
+            return configuredPort;
+        }
     }
 
     /** Stops the IoLoop, shuts down the worker pool, and closes the channel. */
     public void stop() {
-        // TODO: ioLoop.stop(); workers.shutdownNow(); close selector and
-        // serverChannel; started = false.
-        throw new UnsupportedOperationException("TODO");
+        if (ioLoop != null) {
+            ioLoop.stop();
+        }
+        if (workers != null) {
+            workers.shutdownNow();
+        }
+        closeQuietly(selector);
+        closeQuietly(serverChannel);
+        started = false;
     }
 
     /** Whether the server is currently running. */
     public boolean isStarted() {
         return started;
+    }
+
+    /** Closes a resource, swallowing any IOException raised during teardown. */
+    private static void closeQuietly(AutoCloseable resource) {
+        if (resource != null) {
+            try {
+                resource.close();
+            } catch (Exception ignored) {
+                // Teardown is best effort.
+            }
+        }
     }
 }

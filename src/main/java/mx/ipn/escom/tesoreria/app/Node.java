@@ -66,14 +66,18 @@ public final class Node {
 
         Journal journal = null;
         if (config.isLeader()) {
-            // Leader path: durable recovery + live replication feed.
-            GcsAuth auth = new GcsAuth(Path.of(config.gcsKeyfile()));
-            GcsStore store = new GcsStore(auth, config.bucket());
-            journal = new Journal(store);
-            int recovered = journal.recover(bank::applyReplicated);
-            journal.start(recovered);
-
-            bank.addCommitListener(journal);
+            // Durable recovery runs only when Cloud Storage is configured. Without
+            // TES_BUCKET/TES_GCS_KEYFILE the leader still serves every endpoint and
+            // keeps the in-memory invariant; the GCS journal is layered on once
+            // those variables are set, leaving this path unchanged otherwise.
+            if (isConfigured(config.gcsKeyfile()) && isConfigured(config.bucket())) {
+                GcsAuth auth = new GcsAuth(Path.of(config.gcsKeyfile()));
+                GcsStore store = new GcsStore(auth, config.bucket());
+                journal = new Journal(store);
+                int recovered = journal.recover(bank::applyReplicated);
+                journal.start(recovered);
+                bank.addCommitListener(journal);
+            }
 
             ReplicaFeed feed = new ReplicaFeed(config.replPort(), bank.log());
             feed.start();
@@ -108,5 +112,10 @@ public final class Node {
 
         // Block the main thread while the IoLoop and workers serve requests.
         Thread.currentThread().join();
+    }
+
+    /** True when an optional configuration value is present and non-blank. */
+    private static boolean isConfigured(String value) {
+        return value != null && !value.isBlank();
     }
 }

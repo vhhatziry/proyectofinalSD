@@ -73,10 +73,18 @@ public final class Ledger {
             throw TransferException.noSuchAccount(to);
         }
 
-        // TODO: take both intrinsic monitors ordered by id (lower first) and,
-        // while holding them, verify src.balanceCents() >= cents (else throw
-        // lowBalance(from)) before applying the matched debit and credit via
-        // setBalanceCents. See the locking note in the class javadoc.
-        throw new UnsupportedOperationException("TODO");
+        // Acquire both monitors lowest-id first so two opposite transfers on the
+        // same pair cannot deadlock; the balances then change as one atomic step.
+        Account first = (from < to) ? src : dst;
+        Account second = (from < to) ? dst : src;
+        synchronized (first) {
+            synchronized (second) {
+                if (src.balanceCents() < cents) {
+                    throw TransferException.lowBalance(from);
+                }
+                src.setBalanceCents(src.balanceCents() - cents);
+                dst.setBalanceCents(dst.balanceCents() + cents);
+            }
+        }
     }
 }
