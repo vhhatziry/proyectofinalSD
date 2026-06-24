@@ -37,6 +37,7 @@ public final class RunTests {
         cases.addAll(new WireCodecTest().cases());
         cases.addAll(new AuthTest().cases());
         cases.addAll(new ReplayTest().cases());
+        cases.addAll(new CheckpointTest().cases());
 
         int passed = 0;
         int failed = 0;

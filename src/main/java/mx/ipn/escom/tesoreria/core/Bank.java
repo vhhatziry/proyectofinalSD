@@ -110,6 +110,41 @@ public final class Bank {
         sequence.accumulateAndGet(t.seq(), Math::max);
     }
 
+    /**
+     * Seeds the applied watermark and the sequence counter from a restored
+     * follower checkpoint, before replication starts. Both are raised (never
+     * lowered) to {@code watermark} so the subsequent CATCHUP asks the leader
+     * only for transfers past the checkpoint instead of replaying from the start.
+     *
+     * @param watermark highest sequence the loaded checkpoint had already applied
+     */
+    public synchronized void seedLastSeq(long watermark) {
+        lastSeq.accumulateAndGet(watermark, Math::max);
+        sequence.accumulateAndGet(watermark, Math::max);
+    }
+
+    /**
+     * Atomically captures the applied watermark together with a positional
+     * snapshot of account balances, for a follower checkpoint. The balances of
+     * accounts {@code idBase .. idBase + balances.length - 1} are written into
+     * {@code balances} and the current {@link #lastSeq()} is returned, all while
+     * holding this bank's monitor. Because a follower mutates state only through
+     * {@link #applyReplicated} (also synchronized on this bank), the pair is
+     * internally consistent: no replicated transfer can land between reading the
+     * watermark and copying the balances. A missing account reads as 0.
+     *
+     * @param balances destination, one slot per account starting at {@code idBase}
+     * @param idBase   id of the account mapped to slot 0
+     * @return the watermark (highest applied sequence) at capture time
+     */
+    public synchronized long snapshotInto(long[] balances, int idBase) {
+        for (int k = 0; k < balances.length; k++) {
+            Account account = ledger.get(idBase + k);
+            balances[k] = (account != null) ? account.balanceCents() : 0L;
+        }
+        return lastSeq.get();
+    }
+
     /** Highest sequence number handed out so far on this node. */
     public long sequence() {
         return sequence.get();

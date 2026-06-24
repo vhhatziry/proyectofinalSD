@@ -23,6 +23,9 @@ public final class NodeConfig {
     /** Default id of the first account when TES_ID_BASE is unset. */
     public static final int DEFAULT_ID_BASE = 1;
 
+    /** Default seconds between replica checkpoint flushes when TES_REPLICA_CHECKPOINT_INTERVAL_SECS is unset. */
+    public static final int DEFAULT_CHECKPOINT_INTERVAL_SECS = 10;
+
     private final String datasetPath;
     private final String jwtSecret;
     private final String nodeId;
@@ -33,10 +36,13 @@ public final class NodeConfig {
     private final String gcsKeyfile;
     private final int workers;
     private final int idBase;
+    private final int checkpointIntervalSecs;
+    private final String checkpointPath;
 
     private NodeConfig(String datasetPath, String jwtSecret, String nodeId,
                        String peers, String leaderHost, int replPort,
-                       String bucket, String gcsKeyfile, int workers, int idBase) {
+                       String bucket, String gcsKeyfile, int workers, int idBase,
+                       int checkpointIntervalSecs, String checkpointPath) {
         this.datasetPath = datasetPath;
         this.jwtSecret = jwtSecret;
         this.nodeId = nodeId;
@@ -47,6 +53,8 @@ public final class NodeConfig {
         this.gcsKeyfile = gcsKeyfile;
         this.workers = workers;
         this.idBase = idBase;
+        this.checkpointIntervalSecs = checkpointIntervalSecs;
+        this.checkpointPath = checkpointPath;
     }
 
     /**
@@ -66,7 +74,9 @@ public final class NodeConfig {
                 env("TES_BUCKET", null),
                 env("TES_GCS_KEYFILE", null),
                 intEnv("TES_WORKERS", DEFAULT_WORKERS),
-                intEnv("TES_ID_BASE", DEFAULT_ID_BASE));
+                intEnv("TES_ID_BASE", DEFAULT_ID_BASE),
+                intEnv("TES_REPLICA_CHECKPOINT_INTERVAL_SECS", DEFAULT_CHECKPOINT_INTERVAL_SECS),
+                env("TES_REPLICA_CHECKPOINT_PATH", null));
     }
 
     /** Reads an environment variable, returning {@code def} when unset or empty. */
@@ -140,6 +150,24 @@ public final class NodeConfig {
      */
     public int idBase() {
         return idBase;
+    }
+
+    /**
+     * Seconds between periodic replica checkpoint flushes to Cloud Storage
+     * (TES_REPLICA_CHECKPOINT_INTERVAL_SECS, default 10). The periodic flush is a
+     * floor for a hard crash; a graceful stop also writes the exact final state.
+     */
+    public int checkpointIntervalSecs() {
+        return checkpointIntervalSecs;
+    }
+
+    /**
+     * Optional override of the replica checkpoint object name in the bucket
+     * (TES_REPLICA_CHECKPOINT_PATH). When null, the node defaults to
+     * {@code checkpoint/<nodeId>.json}, one object per replica.
+     */
+    public String checkpointPath() {
+        return checkpointPath;
     }
 
     /**

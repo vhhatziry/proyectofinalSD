@@ -17,6 +17,7 @@ import mx.ipn.escom.tesoreria.core.Ledger;
 import mx.ipn.escom.tesoreria.durable.GcsAuth;
 import mx.ipn.escom.tesoreria.durable.GcsStore;
 import mx.ipn.escom.tesoreria.durable.Journal;
+import mx.ipn.escom.tesoreria.durable.ReplicaCheckpoint;
 import mx.ipn.escom.tesoreria.net.Routes;
 import mx.ipn.escom.tesoreria.net.Server;
 import mx.ipn.escom.tesoreria.security.Authenticator;
@@ -98,9 +99,43 @@ public final class Node {
             // Fan-out: every live commit is pushed to the connected replicas.
             bank.addCommitListener(feed);
         } else {
-            // Replica path: catch up from the leader, then apply live commits.
+            // Replica path: restore the durable checkpoint (if Cloud Storage is
+            // configured) so catch-up resumes from the exact sequence this
+            // follower had applied across a full restart, then catch up from the
+            // leader and apply live commits. Without TES_BUCKET/TES_GCS_KEYFILE
+            // (or a node id) the replica still works: it reloads the dataset and
+            // does a full CATCHUP 0, exactly as before.
+            ReplicaCheckpoint checkpoint = null;
+            if (isConfigured(config.gcsKeyfile()) && isConfigured(config.bucket())
+                    && isConfigured(config.nodeId())) {
+                GcsAuth auth = new GcsAuth(Path.of(config.gcsKeyfile()));
+                GcsStore store = new GcsStore(auth, config.bucket());
+                String objectName = isConfigured(config.checkpointPath())
+                        ? config.checkpointPath()
+                        : "checkpoint/" + config.nodeId() + ".json";
+                checkpoint = new ReplicaCheckpoint(store, bank, ledger, objectName,
+                        config.idBase(), config.checkpointIntervalSecs());
+                // Restore BEFORE replication starts, so CATCHUP carries the
+                // restored watermark instead of 0.
+                checkpoint.load();
+                System.out.println("[node] replica resuming at sequence " + bank.lastSeq());
+            }
+
             ReplicaSync sync = new ReplicaSync(config.leaderHost(), config.replPort(), bank);
             sync.start();
+
+            if (checkpoint != null) {
+                checkpoint.start();
+                final ReplicaCheckpoint toFlush = checkpoint;
+                final ReplicaSync toStop = sync;
+                // Stop pulling new commits before the final snapshot so no
+                // applyReplicated runs while the exact state is captured.
+                Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+                    toStop.stop();
+                    toFlush.save();
+                    toFlush.stop();
+                }, "replica-checkpoint"));
+            }
         }
 
         // Security stack shared by the authenticated endpoints.

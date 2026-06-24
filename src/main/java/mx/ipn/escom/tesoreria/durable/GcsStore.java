@@ -126,6 +126,62 @@ public final class GcsStore {
     }
 
     /**
+     * Uploads a checkpoint object under its own name (for example
+     * checkpoint/nodo-2.json), overwriting any previous content. Used by a
+     * replica to persist its {watermark, balances} snapshot. The name is kept
+     * outside the journal/ prefix on purpose so the leader's {@link #readAll()}
+     * never lists it or tries to parse it as a {@link Transfer}.
+     *
+     * @param name    full object name, e.g. {@code checkpoint/nodo-2.json}
+     * @param content the serialized checkpoint body
+     * @throws IOException          if the upload fails or returns non-2xx
+     * @throws InterruptedException if the HTTP exchange is interrupted
+     */
+    public void putCheckpoint(String name, String content)
+            throws IOException, InterruptedException {
+        String url = UPLOAD_BASE + bucket + "/o?uploadType=media&name=" + enc(name);
+        HttpRequest request = HttpRequest.newBuilder(URI.create(url))
+                .timeout(HTTP_TIMEOUT)
+                .header("Authorization", "Bearer " + auth.accessToken())
+                .header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString(content))
+                .build();
+        HttpResponse<String> response = sendWithRetry(request);
+        if (response.statusCode() / 100 != 2) {
+            throw new IOException("GCS upload of " + name + " returned "
+                    + response.statusCode() + ": " + response.body());
+        }
+    }
+
+    /**
+     * Fetches a checkpoint object by name, or returns {@code null} when none
+     * exists yet (HTTP 404), so a first-boot replica falls back to a full
+     * catch-up. Any other non-2xx is raised so a real fetch failure is loud
+     * rather than silently treated as a missing checkpoint.
+     *
+     * @param name full object name, e.g. {@code checkpoint/nodo-2.json}
+     * @return the checkpoint body, or {@code null} if it does not exist
+     * @throws IOException          if the fetch fails or returns an unexpected status
+     * @throws InterruptedException if the HTTP exchange is interrupted
+     */
+    public String getCheckpoint(String name) throws IOException, InterruptedException {
+        String url = API_BASE + bucket + "/o/" + enc(name) + "?alt=media";
+        HttpRequest request = HttpRequest.newBuilder(URI.create(url))
+                .timeout(HTTP_TIMEOUT)
+                .header("Authorization", "Bearer " + auth.accessToken())
+                .GET()
+                .build();
+        HttpResponse<String> response = sendWithRetry(request);
+        if (response.statusCode() == 404) {
+            return null;
+        }
+        if (response.statusCode() / 100 != 2) {
+            throw new IOException("GCS fetch of " + name + " returned " + response.statusCode());
+        }
+        return response.body();
+    }
+
+    /**
      * Counts the journal objects currently stored under the prefix.
      *
      * @return the number of persisted transfers

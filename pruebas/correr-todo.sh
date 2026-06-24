@@ -14,7 +14,7 @@ FAILED=()
 free_ports() {
     local i
     for i in $(seq 1 600); do
-        ss -ltn 2>/dev/null | grep -qE ':(8080|8082|8083|9090) ' || return 0
+        ss -ltn 2>/dev/null | grep -qE ':(8080|8081|8082|8083|9090) ' || return 0
     done
     return 1
 }
@@ -41,11 +41,15 @@ free_ports || echo "  (warning: ports still busy)"
 bash "$REPO/pruebas/endpoints.sh" | tail -2 || FAILED+=("endpoints")
 
 if [ -n "${TES_BUCKET:-}" ] && [ -n "${TES_GCS_KEYFILE:-}" ]; then
-    echo "### GCS cold recovery"
+    echo "### GCS cold recovery (leader journal)"
     free_ports || echo "  (warning: ports still busy)"
     bash "$REPO/pruebas/gcs-recovery.sh" | tail -2 || FAILED+=("gcs-recovery")
+
+    echo "### GCS replica checkpoint (exact catch-up after restart)"
+    free_ports || echo "  (warning: ports still busy)"
+    bash "$REPO/pruebas/gcs-checkpoint.sh" | tail -2 || FAILED+=("gcs-checkpoint")
 else
-    echo "### GCS cold recovery: SKIPPED (set TES_BUCKET + TES_GCS_KEYFILE to run)"
+    echo "### GCS cold recovery + checkpoint: SKIPPED (set TES_BUCKET + TES_GCS_KEYFILE to run)"
 fi
 
 echo "======================================"
