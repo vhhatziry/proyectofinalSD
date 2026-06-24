@@ -96,23 +96,42 @@ bash deploy/apagar.sh              # detiene las VMs (NO borra); pausa el gasto 
 bash deploy/destruir-infra.sh
 ```
 
-## Resultados del ensayo (2026-06-24, jar actual)
+## Throughput (2026-06-24)
 
-Medido desde el generador (e2-standard-4) contra la IP interna del lider, 60s, 128 hilos:
+### Capacidad REAL del banco (medida con `wrk`, cliente eficiente)
 
-| Escenario | Config            | lecturas | transferencias | score     |
-|-----------|-------------------|----------|----------------|-----------|
-| 1         | 3 nodos           | 333,451  | 82,915         | 665,111   |
-| 2         | lider + 1 replica | 347,927  | 87,249         | 696,923   |
-| 3         | solo lider        | 329,730  | 83,133         | 662,262   |
-| **Total** |                   |          |                | **~2,024,296** |
+El lider (e2-standard-4, 4 vCPU), JVM caliente, contra la IP interna desde el generador:
 
-- Todos **CONSISTENT** (invariante conservado). Una corrida de 90s que cruzo el
-  apagado de una replica tambien quedo CONSISTENT (score 1,024,608): el lider no se
-  cae cuando una replica muere bajo carga.
-- El throughput esta **limitado por el generador** (e2-standard-4, tope de cuota de
-  12 vCPU; loadavg ~85). El lider tiene headroom: con un generador mas grande el
-  score sube. Para mas carga, sube el numero de hilos o usa un generador con mas vCPU.
+| Operacion        | Throughput   | CPU del lider |
+|------------------|--------------|---------------|
+| Lecturas (GET)   | **~73,700/s**| ~99% (4 cores)|
+| Transferencias   | **~43,500/s**| ~99%          |
+
+Esto es lo que el generador del profesor (si es eficiente) extraera. El HTTP server
+usa **multi-reactor** (`TES_REACTORS`, default = #vCPU, optimo en 4) para repartir el
+I/O entre los 4 cores; con 1 solo reactor el techo era ~33k. Para medirlo tu mismo:
+
+```bash
+# en el generador (o cualquier instancia en la nube), contra la IP INTERNA del lider:
+TOK=$(curl -s -X POST http://34.67.240.245:8080/api/login -d '{"username":"u","password":"p"}' | jq -r .token)
+sudo apt-get install -y wrk
+wrk -t4 -c200 -d20s -H "Authorization: Bearer $TOK" http://<IP-INTERNA-lider>:8080/api/accounts/5
+```
+
+### Concurso 80/20 con NUESTRO generador (`concurso.sh`)
+
+| Escenario | Config            | score     |
+|-----------|-------------------|-----------|
+| 1         | 3 nodos           | ~656,000  |
+| 2         | lider + 1 replica | ~678,000  |
+| 3         | solo lider        | ~718,000  |
+| **Total** |                   | **~2.05M** |
+
+Todos **CONSISTENT**. OJO: este total esta **limitado por NUESTRO LoadDriver**, no por
+el banco. El LoadDriver es un cliente Java SINCRONO (un hilo bloquea por request); en un
+generador de 4 vCPU topa en ~7k ops/s aunque el banco sirva 73k. Por eso el numero de
+`wrk` (arriba) es el real. La tolerancia a fallos tambien quedo probada: una corrida que
+cruzo el apagado de una replica termino CONSISTENT y el lider nunca se cayo.
 
 ## Notas importantes
 
