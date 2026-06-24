@@ -79,7 +79,7 @@ create_node() { # name machineType leaderHost peersCsv [extraFlags...]
         --image-family="${IMAGE_FAMILY}" --image-project="${IMAGE_PROJECT}" \
         --network="${NETWORK}" --tags="${TAG}" \
         --service-account="${SVC_ACCOUNT}" --scopes="https://www.googleapis.com/auth/cloud-platform" \
-        --metadata="tes-node-id=${name},tes-leader-host=${leader_host},tes-peers=${peers},tes-jwt-secret=${JWT_SECRET}" \
+        --metadata="^@^tes-node-id=${name}@tes-leader-host=${leader_host}@tes-peers=${peers}@tes-jwt-secret=${JWT_SECRET}" \
         --metadata-from-file="startup-script=${STARTUP}" \
         "$@"
 }
