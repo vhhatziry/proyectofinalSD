@@ -17,8 +17,8 @@ GC() { gcloud "$@" --account="${ACCOUNT}" --project="${PROJECT}" --quiet; }
 log() { echo "[infra] $*"; }
 
 main() {
-    log "Deleting instances nodo-1 nodo-2 nodo-3"
-    GC compute instances delete nodo-1 nodo-2 nodo-3 --zone="${ZONE}" 2>/dev/null \
+    log "Deleting instances nodo-1 nodo-2 nodo-3 generador"
+    GC compute instances delete nodo-1 nodo-2 nodo-3 generador --zone="${ZONE}" 2>/dev/null \
         || log "  (some instances already gone)"
     log "Deleting firewall rules"
     GC compute firewall-rules delete "${TAG}-allow-http" 2>/dev/null || log "  (${TAG}-allow-http gone)"
