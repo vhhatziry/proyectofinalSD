@@ -17,7 +17,13 @@ JAR="$REPO/target/tesoreria-distribuida-jar-with-dependencies.jar"
 [ -f "$JAR" ] || { echo "Build first: mvn -q -DskipTests package"; exit 1; }
 command -v jq >/dev/null || { echo "jq required"; exit 1; }
 WORK="$(mktemp -d)"; CSV="$WORK/small.csv"; SECRET="testsecret"; FAIL=0
-head -n 300 "$REPO/material-profesor/alumnos.csv" > "$CSV"
+# Dataset size: default a tiny slice for the fast suite; set TES_TEST_CSV_LINES=full
+# to exercise the real ~820k-account checkpoint (a ~6.5MB object) against the 15s
+# GCS timeout, which is what the graded demo actually runs.
+LINES="${TES_TEST_CSV_LINES:-300}"
+if [ "$LINES" = "full" ]; then cp "$REPO/material-profesor/alumnos.csv" "$CSV"
+else head -n "$LINES" "$REPO/material-profesor/alumnos.csv" > "$CSV"; fi
+echo "  dataset: $(wc -l < "$CSV") accounts"
 GCFLAGS=(); [ -n "${GCLOUD_ACCOUNT:-}" ] && GCFLAGS+=(--account="$GCLOUD_ACCOUNT"); [ -n "${GCLOUD_PROJECT:-}" ] && GCFLAGS+=(--project="$GCLOUD_PROJECT")
 gcclean() { command -v gcloud >/dev/null && gcloud storage rm --recursive \
   "gs://$TES_BUCKET/journal/" "gs://$TES_BUCKET/checkpoint/" "${GCFLAGS[@]}" 2>/dev/null; }

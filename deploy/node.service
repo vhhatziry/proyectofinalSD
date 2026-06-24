@@ -29,6 +29,14 @@ ExecStart=/usr/bin/java -jar /opt/tesoreria/tesoreria-distribuida.jar 8080
 Restart=on-failure
 RestartSec=5
 
+# Graceful stop must deliver SIGTERM so the JVM runs its shutdown hooks: on a
+# replica the hook writes the exact checkpoint (the resume-from-exact-sequence
+# guarantee rides on this), and on the leader it drains the durable journal
+# queue. Allow time for the worst case (one GCS object, up to 3 retries x 15s)
+# plus headroom, so systemd does not SIGKILL the process mid-upload.
+KillSignal=SIGTERM
+TimeoutStopSec=120
+
 # TODO: tune resource limits if needed.
 LimitNOFILE=65536
 
