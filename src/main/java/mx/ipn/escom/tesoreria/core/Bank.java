@@ -77,28 +77,32 @@ public final class Bank {
      * <p>The call is <b>idempotent</b>: a transfer whose sequence is at or below
      * the highest already applied is ignored, so an overlap resent after a
      * reconnect never double-applies and corrupts balances. A fresh transfer is
-     * moved against the local ledger (a missing account is tolerated, since a
-     * follower may not have materialized every account), recorded in the log so
-     * it mirrors the leader, and counted. Both the applied watermark
-     * ({@code lastSeq}) and the sequence counter are then raised to this entry's
-     * sequence: raising {@code sequence} is what lets the leader resume numbering
-     * after cold recovery from the highest journaled sequence instead of from 0,
-     * so the next client transfer never reuses a sequence already in the journal.
+     * <b>settled</b> (force-applied) against the local ledger rather than moved:
+     * it is a transfer the leader already authorised, so it must not be re-gated
+     * on funds. The leader assigns sequence numbers after moving money and not
+     * atomically with it, so two concurrent transfers can be sequenced opposite to
+     * the order they moved; a follower that re-checked funds in sequence order
+     * could reject an authorised transfer and diverge from the leader on those
+     * accounts forever. {@link Ledger#settle} applies the debit/credit
+     * unconditionally, which is order independent and therefore convergent (a
+     * missing account is still tolerated, since a follower may not have
+     * materialized every account). The entry is recorded in the log so it mirrors
+     * the leader, and counted. Both the applied watermark ({@code lastSeq}) and the
+     * sequence counter are then raised to this entry's sequence: raising
+     * {@code sequence} is what lets the leader resume numbering after cold recovery
+     * from the highest journaled sequence instead of from 0, so the next client
+     * transfer never reuses a sequence already in the journal.
      */
     public synchronized void applyReplicated(Transfer t) {
         if (t.seq() <= lastSeq.get()) {
             return; // already applied: a duplicate from a reconnect or replay
         }
         try {
-            ledger.move(t.from(), t.to(), t.cents());
+            ledger.settle(t.from(), t.to(), t.cents());
         } catch (TransferException e) {
-            // A follower may not have materialized every account; tolerate only
-            // that case so catch-up never stalls. Anything else is unexpected on
-            // a follower but must still not break the replication stream.
-            if (!"no_such_account".equals(e.code())) {
-                System.err.println("applyReplicated: unexpected " + e.code()
-                        + " for seq " + t.seq());
-            }
+            // settle force-applies, so the only failure it can raise is a missing
+            // account; a follower may not have materialized every account, so
+            // tolerate it and let catch-up proceed without stalling the stream.
         }
         log.append(t);
         applied.incrementAndGet();

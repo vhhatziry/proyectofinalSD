@@ -29,6 +29,9 @@ java -cp "target/test-classes:$FAT" mx.ipn.escom.tesoreria.tests.RunTests | tail
 echo "### Replication consistency (multi-writer, per-account)"
 java -cp "target/test-classes:$FAT" mx.ipn.escom.tesoreria.tests.ReplConsistency | tail -6 || FAILED+=("repl-consistency")
 
+echo "### Replication convergence under sequence inversion (force-apply)"
+java -cp "target/test-classes:$FAT" mx.ipn.escom.tesoreria.tests.ReplInversion | tail -6 || FAILED+=("repl-inversion")
+
 echo "### Local cluster (replication, fault tolerance, catch-up)"
 free_ports || echo "  (warning: ports still busy)"
 bash "$REPO/pruebas/cluster-local.sh" | tail -3 || FAILED+=("cluster-local")

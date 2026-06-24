@@ -56,14 +56,54 @@ public final class Ledger {
 
     /**
      * Debits {@code cents} from {@code from} and credits the same amount to
-     * {@code to}. Both account monitors are held for the duration so the pair of
-     * balances changes together; the monitors are taken lowest id first to keep
-     * concurrent moves on the same pair from deadlocking.
+     * {@code to}, refusing the move when the source cannot cover it. This is the
+     * client-facing path on the leader, where a transfer must be rejected on
+     * insufficient funds. Both account monitors are held for the duration so the
+     * pair of balances changes together; the monitors are taken lowest id first
+     * to keep concurrent moves on the same pair from deadlocking.
      *
      * @throws TransferException with code {@code no_such_account} if either id is
      *     unknown, or {@code low_balance} if the source cannot cover the amount
      */
     public void move(int from, int to, long cents) throws TransferException {
+        apply(from, to, cents, true);
+    }
+
+    /**
+     * Applies an already-authorised transfer unconditionally: it debits and
+     * credits without re-checking the source balance. Used on the follower and
+     * cold-recovery paths, which replay transfers the leader already accepted.
+     *
+     * <p>Re-gating a replayed transfer on funds would be a bug. The leader stamps
+     * a transfer's sequence number after moving the money, and not atomically
+     * with it, so two concurrent transfers can be sequenced in the opposite order
+     * to the order in which they actually moved money. A follower that replays in
+     * sequence order and re-checks funds would then reject a transfer the leader
+     * had authorised, drop it, and diverge from the leader on those accounts
+     * permanently (the global total stays conserved, which hides it). Applying the
+     * debit and credit unconditionally is order independent, so the follower
+     * always converges to the leader's per-account balances. A balance may go
+     * transiently negative mid-catch-up, which is cosmetic on a follower and
+     * resolves once it is fully caught up.
+     *
+     * @throws TransferException with code {@code no_such_account} if either id is
+     *     unknown
+     */
+    public void settle(int from, int to, long cents) throws TransferException {
+        apply(from, to, cents, false);
+    }
+
+    /**
+     * Shared movement mechanics behind {@link #move} and {@link #settle}: looks up
+     * both accounts, takes their monitors lowest id first, optionally enforces
+     * that the source can cover the amount, then performs the debit and matching
+     * credit as one atomic step.
+     *
+     * @param enforceFunds when true, reject with {@code low_balance} if the source
+     *     cannot cover {@code cents}; when false, apply unconditionally
+     */
+    private void apply(int from, int to, long cents, boolean enforceFunds)
+            throws TransferException {
         Account src = accounts.get(from);
         if (src == null) {
             throw TransferException.noSuchAccount(from);
@@ -79,7 +119,7 @@ public final class Ledger {
         Account second = (from < to) ? dst : src;
         synchronized (first) {
             synchronized (second) {
-                if (src.balanceCents() < cents) {
+                if (enforceFunds && src.balanceCents() < cents) {
                     throw TransferException.lowBalance(from);
                 }
                 src.setBalanceCents(src.balanceCents() - cents);
