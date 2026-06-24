@@ -2,18 +2,25 @@ package mx.ipn.escom.tesoreria.net;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
-import java.nio.channels.SelectionKey;
 import java.nio.channels.Selector;
 import java.nio.channels.ServerSocketChannel;
+import java.nio.channels.SocketChannel;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 /**
- * The HTTP front door. A Server owns exactly ONE ServerSocketChannel, ONE
- * IoLoop reactor thread (with a single Selector), and a fixed pool of worker
- * threads. The IoLoop handles all I/O; workers compute replies. Construction
- * fixes the listening port, the router, and the worker-pool size; start()
- * binds and spins up the loop, stop() tears everything down.
+ * The HTTP front door. A Server owns one ServerSocketChannel, a dedicated
+ * acceptor thread, a pool of {@link IoLoop} reactors (one Selector each) and a
+ * shared pool of worker threads. The acceptor blocks on accept() and round-robins
+ * each new connection to a reactor, so socket reads and writes are spread across
+ * the cores instead of funnelling through a single reactor thread (which
+ * saturates one core and caps throughput while the rest sit idle). The reactors
+ * do all I/O; workers compute replies.
+ *
+ * <p>Construction fixes the port, the router, the worker-pool size and the reactor
+ * count; start() binds and spins everything up, stop() tears it down. One reactor
+ * ({@code reactors == 1}) is the classic single-loop behaviour and a safe
+ * fallback.
  */
 public final class Server {
 
@@ -22,40 +29,72 @@ public final class Server {
     private final int configuredPort;
     private final Routes routes;
     private final int workerCount;
+    private final int reactorCount;
 
     private ServerSocketChannel serverChannel;
-    private Selector selector;
     private ExecutorService workers;
-    private IoLoop ioLoop;
+    private IoLoop[] loops;
+    private Thread acceptorThread;
+    private volatile boolean running;
     private volatile boolean started;
 
     /**
      * Creates a server bound (on start) to the given port, dispatching matched
-     * requests through the supplied routes, with workers worker threads.
+     * requests through the supplied routes, with the given worker-pool size and
+     * number of reactor loops.
      */
-    public Server(int port, Routes routes, int workers) {
+    public Server(int port, Routes routes, int workers, int reactors) {
         this.configuredPort = port;
         this.routes = routes;
         this.workerCount = Math.max(1, workers);
+        this.reactorCount = Math.max(1, reactors);
     }
 
     /**
-     * Opens and binds the server channel, creates the selector and worker
-     * pool, and starts the IoLoop. Idempotent guarding via the started flag.
+     * Opens and binds the server channel, creates the worker pool and the reactor
+     * loops, and starts the acceptor. Idempotent guarding via the started flag.
      */
     public void start() throws IOException {
         if (started) {
             return;
         }
         serverChannel = ServerSocketChannel.open();
-        serverChannel.configureBlocking(false);
         serverChannel.bind(new InetSocketAddress(configuredPort));
-        selector = Selector.open();
-        serverChannel.register(selector, SelectionKey.OP_ACCEPT);
         workers = Executors.newFixedThreadPool(workerCount);
-        ioLoop = new IoLoop(selector, serverChannel, routes, workers, READ_BUFFER_SIZE);
-        ioLoop.start();
+        loops = new IoLoop[reactorCount];
+        for (int i = 0; i < reactorCount; i++) {
+            loops[i] = new IoLoop(Selector.open(), routes, workers, READ_BUFFER_SIZE);
+            loops[i].start();
+        }
+        running = true;
+        acceptorThread = new Thread(this::acceptLoop, "tesoreria-acceptor");
+        acceptorThread.setDaemon(true);
+        acceptorThread.start();
         started = true;
+    }
+
+    /**
+     * Blocking accept loop: hands each new connection to the next reactor in
+     * round-robin so the I/O load is balanced across the loops.
+     */
+    private void acceptLoop() {
+        int next = 0;
+        while (running) {
+            try {
+                SocketChannel socket = serverChannel.accept();
+                if (socket == null) {
+                    continue;
+                }
+                socket.configureBlocking(false);
+                loops[next].register(socket);
+                next = (next + 1) % loops.length;
+            } catch (IOException e) {
+                if (running) {
+                    continue; // a transient accept error; keep serving
+                }
+                return; // channel closed during shutdown
+            }
+        }
     }
 
     /**
@@ -73,16 +112,18 @@ public final class Server {
         }
     }
 
-    /** Stops the IoLoop, shuts down the worker pool, and closes the channel. */
+    /** Stops the acceptor and reactors, shuts down the workers, closes the channel. */
     public void stop() {
-        if (ioLoop != null) {
-            ioLoop.stop();
+        running = false;
+        closeQuietly(serverChannel); // unblocks the acceptor's accept()
+        if (loops != null) {
+            for (IoLoop loop : loops) {
+                loop.stop();
+            }
         }
         if (workers != null) {
             workers.shutdownNow();
         }
-        closeQuietly(selector);
-        closeQuietly(serverChannel);
         started = false;
     }
 

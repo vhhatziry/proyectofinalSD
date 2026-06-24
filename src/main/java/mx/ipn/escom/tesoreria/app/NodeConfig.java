@@ -26,6 +26,9 @@ public final class NodeConfig {
     /** Default seconds between replica checkpoint flushes when TES_REPLICA_CHECKPOINT_INTERVAL_SECS is unset. */
     public static final int DEFAULT_CHECKPOINT_INTERVAL_SECS = 10;
 
+    /** Default number of reactor loops when TES_REACTORS is unset (one per CPU). */
+    public static final int DEFAULT_REACTORS = Runtime.getRuntime().availableProcessors();
+
     private final String datasetPath;
     private final String jwtSecret;
     private final String nodeId;
@@ -38,11 +41,12 @@ public final class NodeConfig {
     private final int idBase;
     private final int checkpointIntervalSecs;
     private final String checkpointPath;
+    private final int reactors;
 
     private NodeConfig(String datasetPath, String jwtSecret, String nodeId,
                        String peers, String leaderHost, int replPort,
                        String bucket, String gcsKeyfile, int workers, int idBase,
-                       int checkpointIntervalSecs, String checkpointPath) {
+                       int checkpointIntervalSecs, String checkpointPath, int reactors) {
         this.datasetPath = datasetPath;
         this.jwtSecret = jwtSecret;
         this.nodeId = nodeId;
@@ -55,6 +59,7 @@ public final class NodeConfig {
         this.idBase = idBase;
         this.checkpointIntervalSecs = checkpointIntervalSecs;
         this.checkpointPath = checkpointPath;
+        this.reactors = reactors;
     }
 
     /**
@@ -76,7 +81,8 @@ public final class NodeConfig {
                 intEnv("TES_WORKERS", DEFAULT_WORKERS),
                 intEnv("TES_ID_BASE", DEFAULT_ID_BASE),
                 intEnv("TES_REPLICA_CHECKPOINT_INTERVAL_SECS", DEFAULT_CHECKPOINT_INTERVAL_SECS),
-                env("TES_REPLICA_CHECKPOINT_PATH", null));
+                env("TES_REPLICA_CHECKPOINT_PATH", null),
+                intEnv("TES_REACTORS", DEFAULT_REACTORS));
     }
 
     /** Reads an environment variable, returning {@code def} when unset or empty. */
@@ -168,6 +174,16 @@ public final class NodeConfig {
      */
     public String checkpointPath() {
         return checkpointPath;
+    }
+
+    /**
+     * Number of reactor loops (selectors) the HTTP server runs (TES_REACTORS,
+     * default one per CPU). More than one spreads socket I/O across cores so a
+     * single reactor thread is not the throughput ceiling; 1 is the classic
+     * single-loop behaviour and a safe fallback.
+     */
+    public int reactors() {
+        return reactors;
     }
 
     /**

@@ -1,5 +1,7 @@
 package mx.ipn.escom.tesoreria.api;
 
+import java.util.regex.Pattern;
+
 import com.google.gson.Gson;
 import com.google.gson.JsonObject;
 
@@ -36,6 +38,9 @@ public final class TransferEndpoint implements Endpoint {
 
     /** Mandatory JSON key for the decimal amount. */
     private static final String KEY_AMOUNT = "amount";
+
+    /** Pre-compiled once: an integer id, optionally signed. Compiling per request would be wasteful. */
+    private static final Pattern INTEGER = Pattern.compile("-?\\d+");
 
     /** Shared JSON codec for parsing the request body. */
     private final Gson gson = new Gson();
@@ -83,7 +88,7 @@ public final class TransferEndpoint implements Endpoint {
         } catch (RuntimeException e) {
             return Reply.json(400, "{\"error\":\"bad_request\"}");
         }
-        if (!srcRaw.matches("-?\\d+") || !dstRaw.matches("-?\\d+")) {
+        if (!INTEGER.matcher(srcRaw).matches() || !INTEGER.matcher(dstRaw).matches()) {
             // Non-numeric account id is a malformed body.
             return Reply.json(400, "{\"error\":\"bad_request\"}");
         }

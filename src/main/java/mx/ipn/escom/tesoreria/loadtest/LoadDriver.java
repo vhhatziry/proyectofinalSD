@@ -58,6 +58,15 @@ public final class LoadDriver {
     /** JSON codec shared across the driver (gson is thread-safe for read/write). */
     private final Gson gson = new Gson();
 
+    /**
+     * ONE HttpClient shared by every worker thread. A per-worker client spawns its
+     * own selector + executor threads, so at high client counts the generator
+     * drowns in hundreds of its own threads (context-switch thrash) and caps far
+     * below what the bank can serve. A single thread-safe client pools keep-alive
+     * connections and keeps the generator's thread count flat.
+     */
+    private final HttpClient sharedClient = newClient();
+
     /** Count of balance reads that returned HTTP 200 with a parseable balance. */
     private final AtomicLong reads = new AtomicLong();
 
@@ -227,7 +236,7 @@ public final class LoadDriver {
     long captureTotalCents() {
         HttpRequest request = HttpRequest.newBuilder(URI.create(baseUrl + "/api/stats"))
                 .timeout(Duration.ofSeconds(10)).GET().build();
-        String body = send(newClient(), request, 200);
+        String body = send(sharedClient, request, 200);
         if (body == null) {
             throw new IllegalStateException("could not read /api/stats for the invariant snapshot");
         }
@@ -376,7 +385,7 @@ public final class LoadDriver {
 
         @Override
         public void run() {
-            HttpClient http = newClient();
+            HttpClient http = sharedClient;
             try {
                 while (System.nanoTime() < deadlineNanos) {
                     if (ThreadLocalRandom.current().nextDouble() < READ_RATIO) {

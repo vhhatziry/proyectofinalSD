@@ -1,5 +1,7 @@
 package mx.ipn.escom.tesoreria.security;
 
+import java.util.regex.Pattern;
+
 import mx.ipn.escom.tesoreria.net.Request;
 
 /**
@@ -9,6 +11,9 @@ import mx.ipn.escom.tesoreria.net.Request;
 public final class Authenticator {
 
     private static final String SCHEME = "Bearer";
+
+    /** Pre-compiled once: splitting on it per request would recompile the pattern on every call. */
+    private static final Pattern WHITESPACE = Pattern.compile("\\s+");
 
     private final CredentialStore store;
     private final Tokens tokens;
@@ -68,7 +73,7 @@ public final class Authenticator {
         if (header == null) {
             return null;
         }
-        String[] parts = header.trim().split("\\s+", 2);
+        String[] parts = WHITESPACE.split(header.trim(), 2);
         if (parts.length < 2 || !SCHEME.equalsIgnoreCase(parts[0])) {
             return null;
         }

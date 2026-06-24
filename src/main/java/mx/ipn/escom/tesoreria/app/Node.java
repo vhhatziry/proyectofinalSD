@@ -156,7 +156,7 @@ public final class Node {
         routes.register("GET", "/panel", new PanelEndpoint(stats, config));
         routes.register("GET", "/", new DashboardEndpoint());
 
-        Server server = new Server(port, routes, config.workers());
+        Server server = new Server(port, routes, config.workers(), config.reactors());
         server.start();
 
         // Block the main thread while the IoLoop and workers serve requests.

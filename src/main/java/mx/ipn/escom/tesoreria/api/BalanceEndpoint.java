@@ -1,6 +1,7 @@
 package mx.ipn.escom.tesoreria.api;
 
 import java.math.BigDecimal;
+import java.util.regex.Pattern;
 
 import com.google.gson.Gson;
 import com.google.gson.JsonObject;
@@ -34,6 +35,9 @@ public final class BalanceEndpoint implements Endpoint {
 
     /** Mandatory JSON key for the decimal balance. */
     private static final String KEY_BALANCE = "balance";
+
+    /** Pre-compiled once: an integer id, optionally signed. Compiling per request would be wasteful. */
+    private static final Pattern INTEGER = Pattern.compile("-?\\d+");
 
     /** Shared JSON codec for building the reply body. */
     private final Gson gson = new Gson();
@@ -71,7 +75,7 @@ public final class BalanceEndpoint implements Endpoint {
             return Reply.status(401);
         }
         String raw = req.pathParam("id");
-        if (raw == null || !raw.trim().matches("-?\\d+")) {
+        if (raw == null || !INTEGER.matcher(raw.trim()).matches()) {
             // Non-numeric path id is a malformed request.
             return Reply.json(400, "{\"error\":\"bad_id\"}");
         }

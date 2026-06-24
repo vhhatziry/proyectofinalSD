@@ -4,7 +4,6 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.SelectionKey;
 import java.nio.channels.Selector;
-import java.nio.channels.ServerSocketChannel;
 import java.nio.channels.SocketChannel;
 import java.nio.charset.StandardCharsets;
 import java.util.Iterator;
@@ -12,22 +11,28 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
 
 /**
- * The single reactor thread. It owns one Selector and does ONLY accept, read,
- * and write. It never computes a Reply inline: the moment a connection's
- * parser reports a complete request, the IoLoop submits a job to the worker
- * pool, which builds the Reply and enqueues the serialized bytes back onto the
- * Channel. The IoLoop then performs the actual flush on the next write event.
- * This is the Reactor + worker-pool design (Doug Lea pattern 3).
+ * One reactor. It owns a single Selector and does ONLY read and write for the
+ * connections assigned to it; accepting is done by the {@link Server}'s acceptor
+ * thread, which round-robins new connections across several IoLoops so the socket
+ * I/O is spread over the cores instead of funnelling through one thread (a single
+ * reactor saturates one core and caps throughput while the others sit idle).
  *
- * <p>Interest-set mutations happen only on this thread. A worker that has
- * finished a reply hands the key back through {@code writeReady} and wakes the
- * selector; the loop then enables OP_WRITE for it. This keeps the classic NIO
- * cross-thread interestOps race out of the design.
+ * <p>It never computes a Reply inline: the moment a connection's parser reports a
+ * complete request, the loop submits a job to the shared worker pool, which builds
+ * the Reply and enqueues the serialized bytes back onto the Channel. The loop then
+ * performs the actual flush on the next write event. This is the Reactor +
+ * worker-pool design (Doug Lea pattern 3).
+ *
+ * <p>Interest-set mutations and channel registration happen only on this loop's
+ * own thread. A new connection arrives via {@link #register(SocketChannel)} (from
+ * the acceptor thread) and is queued; a worker that has finished a reply hands the
+ * key back through {@code writeReady}. Both wake the selector, which drains the
+ * queues at the top of its next pass, keeping the classic cross-thread
+ * interestOps/register race out of the design.
  */
 public final class IoLoop implements Runnable {
 
     private final Selector selector;
-    private final ServerSocketChannel serverChannel;
     private final Routes routes;
     private final ExecutorService workers;
     private final int readBufferSize;
@@ -35,20 +40,18 @@ public final class IoLoop implements Runnable {
     // Keys whose response is ready; the loop enables OP_WRITE for each.
     private final ConcurrentLinkedQueue<SelectionKey> writeReady = new ConcurrentLinkedQueue<>();
 
+    // Sockets handed over by the acceptor; the loop registers each on its selector.
+    private final ConcurrentLinkedQueue<SocketChannel> pending = new ConcurrentLinkedQueue<>();
+
     private volatile boolean running;
     private Thread thread;
 
     /**
-     * Wires the loop to its selector, the listening server channel, the router
-     * used by workers, and the worker pool requests are dispatched to.
+     * Wires the loop to its own selector, the router used by workers, and the
+     * shared worker pool requests are dispatched to.
      */
-    public IoLoop(Selector selector,
-                  ServerSocketChannel serverChannel,
-                  Routes routes,
-                  ExecutorService workers,
-                  int readBufferSize) {
+    public IoLoop(Selector selector, Routes routes, ExecutorService workers, int readBufferSize) {
         this.selector = selector;
-        this.serverChannel = serverChannel;
         this.routes = routes;
         this.workers = workers;
         this.readBufferSize = readBufferSize;
@@ -62,7 +65,7 @@ public final class IoLoop implements Runnable {
         thread.start();
     }
 
-    /** Signals the loop to stop and wakes the selector. */
+    /** Signals the loop to stop, wakes the selector and closes it after the join. */
     public void stop() {
         running = false;
         selector.wakeup();
@@ -73,6 +76,21 @@ public final class IoLoop implements Runnable {
                 Thread.currentThread().interrupt();
             }
         }
+        try {
+            selector.close();
+        } catch (IOException ignored) {
+            // Teardown is best effort.
+        }
+    }
+
+    /**
+     * Assigns a freshly accepted connection to this loop. Called from the acceptor
+     * thread: the socket is only queued here and registered on the selector by the
+     * loop's own thread, so no cross-thread Selector mutation occurs.
+     */
+    public void register(SocketChannel socket) {
+        pending.add(socket);
+        selector.wakeup();
     }
 
     /** The select loop: blocks on the selector and services ready keys. */
@@ -84,6 +102,7 @@ public final class IoLoop implements Runnable {
                 if (!running) {
                     break;
                 }
+                registerPending();
                 enableQueuedWrites();
                 Iterator<SelectionKey> it = selector.selectedKeys().iterator();
                 while (it.hasNext()) {
@@ -93,9 +112,7 @@ public final class IoLoop implements Runnable {
                         continue;
                     }
                     try {
-                        if (key.isAcceptable()) {
-                            onAccept(key);
-                        } else if (key.isWritable()) {
+                        if (key.isWritable()) {
                             onWrite(key);
                         } else if (key.isReadable()) {
                             onRead(key);
@@ -110,6 +127,19 @@ public final class IoLoop implements Runnable {
         }
     }
 
+    /** Registers every queued new connection on this loop's selector for reads. */
+    private void registerPending() {
+        SocketChannel socket;
+        while ((socket = pending.poll()) != null) {
+            try {
+                Channel channel = new Channel(socket, readBufferSize);
+                socket.register(selector, SelectionKey.OP_READ, channel);
+            } catch (IOException e) {
+                closeQuietly(socket);
+            }
+        }
+    }
+
     /** Turns on OP_WRITE for every key a worker has finished a reply for. */
     private void enableQueuedWrites() {
         SelectionKey key;
@@ -118,17 +148,6 @@ public final class IoLoop implements Runnable {
                 key.interestOps(key.interestOps() | SelectionKey.OP_WRITE);
             }
         }
-    }
-
-    /** Accepts a new connection and registers it for reads with a Channel. */
-    private void onAccept(SelectionKey key) throws IOException {
-        SocketChannel socket = serverChannel.accept();
-        if (socket == null) {
-            return;
-        }
-        socket.configureBlocking(false);
-        Channel channel = new Channel(socket, readBufferSize);
-        socket.register(selector, SelectionKey.OP_READ, channel);
     }
 
     /**
@@ -212,6 +231,15 @@ public final class IoLoop implements Runnable {
             key.channel().close();
         } catch (IOException ignored) {
             // Best effort on teardown.
+        }
+    }
+
+    /** Closes a not-yet-registered socket, swallowing errors. */
+    private void closeQuietly(SocketChannel socket) {
+        try {
+            socket.close();
+        } catch (IOException ignored) {
+            // Best effort.
         }
     }
 
