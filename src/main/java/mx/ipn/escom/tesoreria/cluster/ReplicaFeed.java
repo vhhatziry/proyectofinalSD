@@ -1,14 +1,17 @@
 package mx.ipn.escom.tesoreria.cluster;
 
+import java.io.BufferedOutputStream;
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
-import java.io.OutputStream;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.TimeUnit;
 
 import mx.ipn.escom.tesoreria.core.CommitListener;
 import mx.ipn.escom.tesoreria.core.Transfer;
@@ -21,19 +24,35 @@ import mx.ipn.escom.tesoreria.core.TransferLog;
  * <p>The feed publishes the leader's commit stream over plain TCP. It listens on
  * the replication port; when a replica dials in it announces how far it has
  * already caught up with a one-line greeting {@code "CATCHUP <seq>"}. The feed
- * answers by replaying, in order, every transfer in the {@link TransferLog}
- * whose sequence is past that watermark, each rendered as a JSON line by
- * {@link WireCodec}. Once the backlog is drained the socket stays open and joins
- * the live audience.
+ * answers by replaying, in order, every transfer in the {@link TransferLog} whose
+ * sequence is past that watermark, each rendered as a JSON line by
+ * {@link WireCodec}, and then keeps streaming fresh commits live.
  *
- * <p>Because the feed is a {@link CommitListener} attached to the leader, each
- * fresh commit is encoded once and fanned out to every connected replica. A
- * subscriber whose write fails is simply dropped from the audience; the leader
- * keeps serving the rest. The brief gap between finishing the replay and joining
- * the live audience is closed naturally on the replica's next reconnect, which
- * re-issues CATCHUP from its current watermark.
+ * <p><b>The socket I/O is decoupled from the commit path.</b> The feed is a
+ * {@link CommitListener} invoked inline on the leader's commit threads, so it must
+ * never block there. Each subscriber owns a bounded queue and a dedicated writer
+ * thread; {@link #onCommit} only does a non-blocking {@code offer} into each
+ * queue. A replica whose socket stalls (e.g. a powered-off VM whose TCP send
+ * buffer fills and whose writes would block forever) only backs up its OWN queue;
+ * when that queue fills, the subscriber is dropped and its socket closed, which
+ * unblocks its writer and makes the replica reconnect. The commit path and the
+ * other replicas are never affected. This is what keeps the leader serving when a
+ * replica is stopped, as the contract's fault-tolerance scenarios require.
+ *
+ * <p>Ordering is upheld without a global broadcast lock: the leader appends a
+ * transfer to the log before notifying listeners, and a subscriber is added to
+ * the live audience before its writer reads the backlog, so every commit reaches
+ * a replica via the backlog, the live queue, or (harmlessly) both. Duplicates and
+ * minor reordering across that boundary are absorbed by the replica, which drops
+ * any sequence at or below its watermark and reorders the rest.
  */
 public final class ReplicaFeed implements CommitListener {
+
+    /** Outbound lines buffered per subscriber before it is judged too slow and dropped. */
+    private static final int QUEUE_CAPACITY = 8192;
+
+    /** How long a writer waits for a queued line before re-checking its liveness. */
+    private static final long POLL_MS = 200L;
 
     /** TCP port replicas connect to (TES_REPL_PORT). */
     private final int port;
@@ -41,11 +60,8 @@ public final class ReplicaFeed implements CommitListener {
     /** History of committed transfers used to satisfy a CATCHUP request. */
     private final TransferLog log;
 
-    /** Live audience: replica sockets currently receiving fresh commits. */
-    private final List<Socket> subscribers = new CopyOnWriteArrayList<>();
-
-    /** Guards a single broadcast so concurrent commits never interleave bytes. */
-    private final Object broadcastLock = new Object();
+    /** Live audience: subscribers currently receiving fresh commits. */
+    private final List<Subscriber> subscribers = new CopyOnWriteArrayList<>();
 
     /** Listening server socket; null until {@link #start()} runs. */
     private volatile ServerSocket serverSocket;
@@ -90,7 +106,7 @@ public final class ReplicaFeed implements CommitListener {
         while (running) {
             try {
                 Socket socket = serverSocket.accept();
-                Thread worker = new Thread(() -> serveReplica(socket), "replica-feed-worker");
+                Thread worker = new Thread(() -> serveReplica(socket), "replica-feed-accept-worker");
                 worker.setDaemon(true);
                 worker.start();
             } catch (IOException ex) {
@@ -104,9 +120,11 @@ public final class ReplicaFeed implements CommitListener {
     }
 
     /**
-     * Reads the {@code "CATCHUP <seq>"} greeting from a freshly connected
-     * replica, replays every logged transfer past that watermark and then
-     * registers the socket in the live audience.
+     * Reads the {@code "CATCHUP <seq>"} greeting, registers the connection in the
+     * live audience and starts its writer thread. The writer replays the backlog
+     * past the watermark and then streams live commits; registering before the
+     * writer reads the log guarantees no commit slips through the gap between the
+     * two (it is delivered by the backlog, the live queue, or both).
      *
      * @param socket the accepted replica connection
      */
@@ -114,22 +132,10 @@ public final class ReplicaFeed implements CommitListener {
         try {
             BufferedReader reader = new BufferedReader(
                     new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
-            String greeting = reader.readLine();
-            long since = parseCatchup(greeting);
-            // Replay the backlog and join the live audience atomically with
-            // respect to onCommit, which also holds broadcastLock. This closes
-            // the window where a commit landing between the end of the backlog
-            // and the subscribe would never reach this replica, and keeps the
-            // backlog writes from interleaving with a live broadcast on the same
-            // socket. A connecting replica briefly pauses live fan-out for the
-            // length of its replay; that cost is bounded and only paid at
-            // (re)connect time.
-            synchronized (broadcastLock) {
-                for (Transfer t : log.since(since)) {
-                    writeLine(socket, WireCodec.encode(t));
-                }
-                subscribers.add(socket);
-            }
+            long since = parseCatchup(reader.readLine());
+            Subscriber subscriber = new Subscriber(socket, since);
+            subscribers.add(subscriber);
+            subscriber.start();
         } catch (IOException ex) {
             closeQuietly(socket);
         }
@@ -157,43 +163,27 @@ public final class ReplicaFeed implements CommitListener {
     }
 
     /**
-     * Receives a freshly committed transfer from the leader and broadcasts it as
-     * one JSON line to every connected replica.
-     *
-     * <p>The whole fan-out runs under a private lock so that, when several
-     * commit threads notify at once, each transfer is written to a subscriber in
-     * one piece instead of having its bytes interleaved with another transfer on
-     * the same socket. The lock orders only the byte writes; it does not impose
-     * any sequence ordering on the commits themselves.
+     * Receives a freshly committed transfer and offers it to every subscriber's
+     * outbound queue. The offer never blocks: a subscriber whose queue is full has
+     * fallen too far behind (a stalled or dead socket) and is dropped, so the
+     * commit path keeps moving no matter how a replica misbehaves.
      *
      * @param t the committed transfer to fan out
      */
     @Override
     public void onCommit(Transfer t) {
         String line = WireCodec.encode(t);
-        synchronized (broadcastLock) {
-            for (Socket socket : subscribers) {
-                try {
-                    writeLine(socket, line);
-                } catch (IOException ex) {
-                    subscribers.remove(socket);
-                    closeQuietly(socket);
-                }
+        for (Subscriber subscriber : subscribers) {
+            if (!subscriber.enqueue(line)) {
+                drop(subscriber);
             }
         }
     }
 
-    /**
-     * Writes one wire line followed by a newline and flushes it.
-     *
-     * @param socket the destination socket
-     * @param line   the JSON line to send (without newline)
-     * @throws IOException if the write fails
-     */
-    private void writeLine(Socket socket, String line) throws IOException {
-        OutputStream out = socket.getOutputStream();
-        out.write((line + "\n").getBytes(StandardCharsets.UTF_8));
-        out.flush();
+    /** Removes a subscriber and closes its socket, which unblocks and ends its writer. */
+    private void drop(Subscriber subscriber) {
+        subscribers.remove(subscriber);
+        subscriber.close();
     }
 
     /**
@@ -203,8 +193,8 @@ public final class ReplicaFeed implements CommitListener {
     public void stop() {
         running = false;
         closeServer();
-        for (Socket socket : subscribers) {
-            closeQuietly(socket);
+        for (Subscriber subscriber : subscribers) {
+            subscriber.close();
         }
         subscribers.clear();
     }
@@ -227,6 +217,92 @@ public final class ReplicaFeed implements CommitListener {
             socket.close();
         } catch (IOException ignored) {
             // Already failing; the drop is the intended outcome.
+        }
+    }
+
+    /**
+     * One connected replica: its socket, a bounded outbound queue, and a writer
+     * thread that drains the queue to the socket. Decoupling the write onto this
+     * thread is what keeps a stalled replica from blocking the leader's commit
+     * path; the queue bounds how far a slow replica may lag before it is dropped.
+     */
+    private final class Subscriber {
+
+        /** Connection to the replica. */
+        private final Socket socket;
+
+        /** Replica watermark from its CATCHUP greeting; the backlog starts past it. */
+        private final long since;
+
+        /** Outbound lines awaiting the writer; bounded so a stalled socket is detected. */
+        private final BlockingQueue<String> queue = new ArrayBlockingQueue<>(QUEUE_CAPACITY);
+
+        /** False once the subscriber is dropped (queue overflow, write failure or stop). */
+        private volatile boolean alive = true;
+
+        /** Thread that replays the backlog and then streams live commits. */
+        private final Thread writer = new Thread(this::run, "replica-feed-writer");
+
+        Subscriber(Socket socket, long since) {
+            this.socket = socket;
+            this.since = since;
+            this.writer.setDaemon(true);
+        }
+
+        /** Starts the writer thread. */
+        void start() {
+            writer.start();
+        }
+
+        /**
+         * Offers one line from the commit path. Returns false (and marks the
+         * subscriber dead) when the queue is full, i.e. the replica cannot keep up
+         * and must be dropped rather than allowed to back-pressure the leader.
+         */
+        boolean enqueue(String line) {
+            if (!alive) {
+                return false;
+            }
+            if (!queue.offer(line)) {
+                alive = false;
+                return false;
+            }
+            return true;
+        }
+
+        /** Marks the subscriber dead and closes the socket, unblocking the writer. */
+        void close() {
+            alive = false;
+            writer.interrupt();
+            closeQuietly(socket);
+        }
+
+        /** Replays the backlog past {@link #since}, then streams the live queue. */
+        private void run() {
+            try {
+                BufferedOutputStream out = new BufferedOutputStream(socket.getOutputStream());
+                // Backlog: one buffered flush so a long catch-up is not a flush per
+                // line. Overlap with the live queue is harmless (the replica drops
+                // any sequence at or below its watermark).
+                for (Transfer t : log.since(since)) {
+                    out.write((WireCodec.encode(t) + "\n").getBytes(StandardCharsets.UTF_8));
+                }
+                out.flush();
+                // Live: flush per line so fresh commits reach the replica promptly.
+                while (alive || !queue.isEmpty()) {
+                    String line = queue.poll(POLL_MS, TimeUnit.MILLISECONDS);
+                    if (line != null) {
+                        out.write((line + "\n").getBytes(StandardCharsets.UTF_8));
+                        out.flush();
+                    }
+                }
+            } catch (IOException | InterruptedException ex) {
+                // Broken pipe or interrupted on drop: this subscriber is finished.
+            } finally {
+                alive = false;
+                subscribers.remove(this);
+                closeQuietly(socket);
+            }
         }
     }
 }
