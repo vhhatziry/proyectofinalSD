@@ -111,12 +111,10 @@ public final class LoadDriver {
 
         String baseUrl = "http://" + host + ":" + port;
 
-        // TODO: register a fresh user and log in to obtain the bearer token.
         String token = bootstrapToken(baseUrl);
 
         LoadDriver driver = new LoadDriver(baseUrl, token, minId, maxId);
 
-        // TODO: snapshot the total before the run so the invariant can be checked.
         long initialTotalCents = driver.captureTotalCents();
 
         driver.run(seconds, clients);
@@ -254,7 +252,6 @@ public final class LoadDriver {
     void verifyAndReport(long initialTotalCents, String scenario) {
         long finalTotalCents = captureTotalCents();
         if (finalTotalCents != initialTotalCents) {
-            // TODO: locate and print the account(s) whose balance is impossible.
             System.out.println("INCONSISTENT: expected " + initialTotalCents
                     + " cents, found " + finalTotalCents + " cents");
             reportCulprit(initialTotalCents, finalTotalCents);

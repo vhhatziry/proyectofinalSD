@@ -259,7 +259,7 @@
         <span class="pill" id="livePill" data-live="off"><span class="pill__dot"></span><span id="liveText">Sin conexion</span></span>
         <button class="btn" id="refresh" type="button">Refrescar</button>
         <label class="switch">
-          <input type="checkbox" id="reactive">
+          <input type="checkbox" id="reactive" checked>
           <span class="switch__track"></span>
           <span class="switch__label">En vivo</span>
         </label>
@@ -457,7 +457,9 @@
 
     $("refresh").addEventListener("click", loadPanel);
     $("reactive").addEventListener("change", (e) => toggleReactive(e.target.checked));
-    loadPanel();
+    // Honor the checkbox's default (checked): start live polling on load so the
+    // dashboard updates by itself, without pressing "Refrescar" (rubric extra).
+    toggleReactive($("reactive").checked);
   </script>
 </body>
 </html>

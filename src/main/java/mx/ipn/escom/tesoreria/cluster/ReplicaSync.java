@@ -112,8 +112,14 @@ public final class ReplicaSync {
         // so any stale out-of-order remainder from the previous link is discarded.
         TreeMap<Long, Transfer> pending = new TreeMap<>();
         try {
+            // Rubric (item 4): on every revival the replica must SHOW where it
+            // stopped and from which sequence it asks the leader to resume. Capture
+            // the watermark once so the printed message and the CATCHUP agree.
+            long seq = bank.lastSeq();
+            System.out.println("[replica] Me quede en la secuencia " + seq
+                    + ", enviame desde " + (seq + 1));
             OutputStream out = connection.getOutputStream();
-            out.write(("CATCHUP " + bank.lastSeq() + "\n").getBytes(StandardCharsets.UTF_8));
+            out.write(("CATCHUP " + seq + "\n").getBytes(StandardCharsets.UTF_8));
             out.flush();
             BufferedReader reader = new BufferedReader(
                     new InputStreamReader(connection.getInputStream(), StandardCharsets.UTF_8));

@@ -13,8 +13,6 @@
 # an EMPTY TES_LEADER_HOST means this node is the LEADER. The actual
 # per-node values are read from GCE instance metadata so the SAME script
 # boots all three nodes.
-#
-# SKELETON: structure is real; fill the TODOs with project values.
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
@@ -42,7 +40,6 @@ log() { echo "[startup] $*"; }
 install_runtime() {
     log "Installing JRE 17 and helpers"
     export DEBIAN_FRONTEND=noninteractive
-    # TODO: confirm package name on the target image (Debian 12: openjdk-17-jre-headless).
     apt-get update -y
     apt-get install -y openjdk-17-jre-headless curl ca-certificates
 }
@@ -52,7 +49,7 @@ install_runtime() {
 # ---------------------------------------------------------------------------
 prepare_user() {
     log "Preparing application user and directories"
-    # TODO: create a non-login system user if it does not exist.
+    # Create a non-login system user if it does not exist.
     id -u "${APP_USER}" >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin "${APP_USER}"
     mkdir -p "${APP_HOME}" "$(dirname "${ENV_FILE}")"
 }
@@ -62,7 +59,6 @@ prepare_user() {
 # ---------------------------------------------------------------------------
 read_metadata() {
     # Helper: read a custom instance-metadata attribute by name.
-    # TODO: confirm attribute names match those set at instance creation.
     local key="$1"
     curl -s -H "Metadata-Flavor: Google" \
         "http://metadata.google.internal/computeMetadata/v1/instance/attributes/${key}" || true
@@ -94,10 +90,10 @@ write_env() {
     # Leave TES_LEADER_HOST EMPTY on the leader; set it to the leader host on
     # each replica. NodeConfig.isLeader() == (TES_LEADER_HOST empty/absent).
     local node_id leader_host peers jwt_secret
-    node_id="$(read_metadata tes-node-id)"        # TODO: e.g. "node-1"
-    leader_host="$(read_metadata tes-leader-host)" # TODO: empty on leader
-    peers="$(read_metadata tes-peers)"            # TODO: comma-separated host:port list
-    jwt_secret="$(read_metadata tes-jwt-secret)"  # TODO: SAME value across the 3 nodes
+    node_id="$(read_metadata tes-node-id)"        # e.g. "nodo-1"
+    leader_host="$(read_metadata tes-leader-host)" # empty on the leader
+    peers="$(read_metadata tes-peers)"            # comma-separated host:port list
+    jwt_secret="$(read_metadata tes-jwt-secret)"  # SAME value across the 3 nodes
 
     # NOTE: the variable name is TES_JWT_SECRET on every node even though the
     #       secret value is identical cluster-wide.

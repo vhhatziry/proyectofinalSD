@@ -26,7 +26,6 @@ public final class Money {
      * @return the equivalent value in cents
      */
     public static long toCents(String decimal) {
-        // TODO: new BigDecimal(decimal).movePointRight(2).setScale(0, HALF_UP).longValueExact()
         return new BigDecimal(decimal)
                 .movePointRight(2)
                 .setScale(0, RoundingMode.HALF_UP)
@@ -41,7 +40,6 @@ public final class Money {
      * @return the amount as a decimal string
      */
     public static String toDecimal(long cents) {
-        // TODO: BigDecimal.valueOf(cents).movePointLeft(2).setScale(2)
         return BigDecimal.valueOf(cents)
                 .movePointLeft(2)
                 .setScale(2, RoundingMode.UNNECESSARY)
