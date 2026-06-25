@@ -1,6 +1,7 @@
 package mx.ipn.escom.tesoreria.core;
 
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.LongSupplier;
 
 /**
@@ -27,6 +28,35 @@ public final class Ledger {
 
     private final ConcurrentHashMap<Integer, Account> accounts = new ConcurrentHashMap<>();
 
+    /**
+     * Read/write lock that makes {@link #totalCents()} a consistent snapshot.
+     * Every money movement (the shared {@link #apply} path) holds the SHARED
+     * (read) side while it does its debit+credit, so any number of transfers
+     * still run in parallel; the scan in {@code totalCents()} holds the
+     * EXCLUSIVE (write) side, so it can never run concurrently with a
+     * half-applied transfer (debit done, credit pending) and therefore never
+     * captures a torn read. Because transfers are zero-sum the true total is
+     * invariant, so an atomic scan reports the exact same total on every node
+     * and the dashboard consistency seal stays green even under load.
+     *
+     * <p>FAIR (true): a continuous stream of transfers (readers) must not
+     * starve the scan (writer). With fairness the writer that is waiting is
+     * served in arrival order, so the dashboard's {@code /panel} cannot hang
+     * under sustained transfer load.
+     *
+     * <p>Lock-order invariant (the account monitor is always a SINK, never
+     * taken before this lock, so the lock graph stays a DAG and is deadlock
+     * free):
+     * <ul>
+     *   <li>transfer/settle: readLock -&gt; account monitors</li>
+     *   <li>replica apply: bank monitor -&gt; readLock -&gt; account monitors</li>
+     *   <li>scan: writeLock -&gt; account monitor (one at a time, read-only,
+     *       uncontended because the writeLock excludes all writers)</li>
+     * </ul>
+     * NEVER acquire this lock while already holding an account monitor.
+     */
+    private final ReentrantReadWriteLock snapshotLock = new ReentrantReadWriteLock(true);
+
     /** Registers an account. A later registration with the same id replaces the earlier one. */
     public void add(Account a) {
         accounts.put(a.id(), a);
@@ -43,16 +73,33 @@ public final class Ledger {
     }
 
     /**
-     * Sum of every account balance in cents. With no concurrent movement this
-     * equals the value loaded at startup; observing it under load is the way the
-     * system checks that transfers conserve money.
+     * Sum of every account balance in cents, captured as a CONSISTENT SNAPSHOT.
+     * The scan runs under the EXCLUSIVE (write) side of {@link #snapshotLock},
+     * which is mutually exclusive with the SHARED (read) side held by every
+     * money movement in {@link #apply}. Therefore the scan never overlaps a
+     * half-applied transfer (debit done, credit pending) and reads an EXACT
+     * total even while transfers run concurrently. With no concurrent movement
+     * this equals the value loaded at startup; observing it under load is how
+     * the system checks that transfers conserve money, and because transfers
+     * are zero-sum every node reports the identical total under an atomic scan.
+     *
+     * <p>Lock order while scanning: writeLock -&gt; account monitor (per
+     * account, one at a time, via the synchronized {@link Account#balanceCents()};
+     * these acquisitions are uncontended because the writeLock excludes all
+     * writers). The scan is not a leaf lock, but the account monitor is always a
+     * sink in the lock graph, so this stays deadlock free.
      */
     public long totalCents() {
-        long sum = 0L;
-        for (Account a : accounts.values()) {
-            sum += a.balanceCents();
+        snapshotLock.writeLock().lock();
+        try {
+            long sum = 0L;
+            for (Account a : accounts.values()) {
+                sum += a.balanceCents();
+            }
+            return sum;
+        } finally {
+            snapshotLock.writeLock().unlock();
         }
-        return sum;
     }
 
     /**
@@ -148,17 +195,30 @@ public final class Ledger {
         // same pair cannot deadlock; the balances then change as one atomic step.
         Account first = (from < to) ? src : dst;
         Account second = (from < to) ? dst : src;
-        synchronized (first) {
-            synchronized (second) {
-                if (enforceFunds && src.balanceCents() < cents) {
-                    throw TransferException.lowBalance(from);
+        // Hold the SHARED side of snapshotLock across the debit+credit so that a
+        // consistent scan in totalCents() (which holds the EXCLUSIVE side) can
+        // never observe this transfer half applied. The readLock is taken BEFORE
+        // the account monitors (the account monitor stays a sink in the lock
+        // graph), and is released in finally so a rejected move (low_balance) or
+        // a missing account never leaks the lock and stalls the scan. The
+        // accounts.get lookups and null-checks above are deliberately outside the
+        // lock so the shared critical section covers only the money movement.
+        snapshotLock.readLock().lock();
+        try {
+            synchronized (first) {
+                synchronized (second) {
+                    if (enforceFunds && src.balanceCents() < cents) {
+                        throw TransferException.lowBalance(from);
+                    }
+                    src.setBalanceCents(src.balanceCents() - cents);
+                    dst.setBalanceCents(dst.balanceCents() + cents);
+                    // Stamp the sequence inside the lock (when one was requested) so the
+                    // commit order matches the money-movement order; see the move overload.
+                    return (sequencer != null) ? sequencer.getAsLong() : 0L;
                 }
-                src.setBalanceCents(src.balanceCents() - cents);
-                dst.setBalanceCents(dst.balanceCents() + cents);
-                // Stamp the sequence inside the lock (when one was requested) so the
-                // commit order matches the money-movement order; see the move overload.
-                return (sequencer != null) ? sequencer.getAsLong() : 0L;
             }
+        } finally {
+            snapshotLock.readLock().unlock();
         }
     }
 }

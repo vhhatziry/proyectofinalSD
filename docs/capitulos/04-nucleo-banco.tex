@@ -62,10 +62,12 @@ cuentas se almacenan en un \codigo{ConcurrentHashMap<Integer, Account>}, de modo
 que las lecturas (\codigo{get}) y el alta de cuentas (\codigo{add}) son libres de
 candado. La consulta de un saldo individual es simplemente
 \codigo{ledger.get(id).balanceCents()}. La suma global se obtiene con
-\codigo{totalCents()}, que recorre todas las cuentas acumulando sus saldos; sin
-movimientos concurrentes ese total es exactamente el valor cargado al inicio, y
-observarlo bajo carga es la forma en que el sistema verifica que las
-transferencias conservan el dinero.
+\codigo{totalCents()}, que recorre todas las cuentas acumulando sus saldos como
+una lectura consistente: aun bajo movimientos concurrentes ese total es
+exactamente el valor cargado al inicio, porque el escaneo toma un snapshot
+atomico (lo detalla la subseccion \emph{Snapshot atomico del total}). Observarlo
+bajo carga es la forma en que el sistema verifica que las transferencias
+conservan el dinero.
 
 Todos los nodos parten del mismo estado gracias a \codigo{core/Dataset.java},
 que carga el dataset compartido de cuentas en un ledger. El archivo es un CSV
@@ -143,13 +145,96 @@ cuerpo JSON de error. La \codigo{core/Transfer.java} resultante es un
 \codigo{cents}): es la unidad de replicacion y durabilidad que el codec del
 cluster y el journal en GCS serializan.
 
+\subsection{Snapshot atomico del total (lectura consistente)}
+
+Sumar las 820k cuentas mientras el banco recibe transferencias no es inocuo: un
+escaneo ingenuo puede caer justo entre el debito y el credito de una misma
+transferencia (origen ya restado, destino aun no sumado) y reportar un total
+\emph{roto} que no corresponde a ningun estado real. Para que
+\codigo{Ledger.totalCents()} sea siempre una lectura consistente, el ledger anade
+un segundo mecanismo de sincronizacion, separado de los monitores de cuenta: un
+\codigo{ReentrantReadWriteLock} llamado \codigo{snapshotLock}.
+
+La clave es una inversion deliberada de los lados del candado. Cada movimiento de
+dinero (los caminos \codigo{move}, \codigo{settle} y el \codigo{apply} privado
+que comparten) toma el lado \textbf{COMPARTIDO} (read) de \codigo{snapshotLock}
+mientras hace su debito y su credito; el escaneo de \codigo{totalCents()} toma el
+lado \textbf{EXCLUSIVO} (write). Es decir, los lectores-del-candado son los
+escritores-del-dinero, y el escritor-del-candado es el unico lector global. Como
+el lado compartido admite cualquier numero de titulares simultaneos, todas las
+transferencias siguen ejecutandose en paralelo entre si; pero el lado exclusivo
+excluye a todas, de modo que la suma no puede solaparse jamas con una
+transferencia a medio aplicar. El escaneo observa, por construccion, un estado
+donde cada transferencia esta completa o aun no empezada: un \emph{snapshot}
+atomico.
+
+\begin{lstlisting}[language=Java,caption={Ledger: lado compartido en el movimiento, lado exclusivo en el escaneo}]
+// En apply(...): el debito+credito corre bajo el lado COMPARTIDO,
+// asi muchos transferencias avanzan a la vez. El readLock se toma ANTES
+// de los monitores de cuenta (el monitor de cuenta es el sumidero del grafo).
+snapshotLock.readLock().lock();
+try {
+    synchronized (first) {
+        synchronized (second) {
+            src.setBalanceCents(src.balanceCents() - cents);
+            dst.setBalanceCents(dst.balanceCents() + cents);
+            return (sequencer != null) ? sequencer.getAsLong() : 0L;
+        }
+    }
+} finally {
+    snapshotLock.readLock().unlock();
+}
+
+// En totalCents(): el escaneo corre bajo el lado EXCLUSIVO, que excluye
+// a todo movimiento, por lo que nunca ve un debito sin su credito.
+public long totalCents() {
+    snapshotLock.writeLock().lock();
+    try {
+        long sum = 0L;
+        for (Account a : accounts.values()) {
+            sum += a.balanceCents();
+        }
+        return sum;
+    } finally {
+        snapshotLock.writeLock().unlock();
+    }
+}
+\end{lstlisting}
+
+Las dos capas de candados componen sin riesgo de deadlock porque forman un grafo
+dirigido aciclico: el \codigo{readLock} se adquiere \emph{antes} que los monitores
+de cuenta, y el monitor de cuenta es siempre el sumidero (nunca se toma el
+\codigo{snapshotLock} teniendo ya un monitor de cuenta). Asi, el orden por id que
+ya evitaba el deadlock entre transferencias inversas se mantiene intacto, y el
+nuevo candado solo agrega un nivel por encima.
+
+\textbf{Por que el invariante queda exacto en los tres nodos.} Como toda
+transferencia es suma-cero (un debito acompanado de un credito igual), el total
+verdadero es invariante: no cambia jamas. Y como el escaneo de cada nodo corre
+bajo el lado exclusivo, no puede capturar una transferencia a medio aplicar; por
+tanto reporta exactamente ese total invariante, no un valor transitorio. Los tres
+nodos parten del mismo dataset, de modo que los tres escaneos atomicos devuelven
+la misma constante aun bajo carga. Eso es justo lo que el sello de consistencia
+del dashboard compara: con el snapshot atomico, el sello permanece verde bajo
+trafico sostenido en lugar de parpadear por lecturas rotas espurias.
+
+\textbf{Por que \codigo{fair} evita la inanicion del escaneo.} El
+\codigo{snapshotLock} se construye en modo justo (\codigo{new
+ReentrantReadWriteLock(true)}). Sin justicia, un flujo continuo de transferencias
+(lectores-del-candado) podria mantener el lado compartido siempre tomado y
+\emph{matar de hambre} al escaneo (escritor-del-candado), que nunca conseguiria
+el lado exclusivo. Con justicia, el escritor que espera se atiende en orden de
+llegada, asi que el endpoint \codigo{/panel} no puede colgarse bajo carga
+sostenida de transferencias.
+
 \subsection{Invariante de saldo y numero de secuencia}
 
 El invariante central es la conservacion del dinero: como cada movimiento es un
 debito en una cuenta acompanado de un credito por la misma cantidad en otra, la
 suma global de saldos permanece constante. Ese es precisamente el valor que
-expone \codigo{Ledger.totalCents()}, y su constancia bajo carga es lo que
-demuestra que las transferencias no crean ni destruyen dinero. El ledger se
+expone \codigo{Ledger.totalCents()}, leido como un snapshot atomico, y su
+constancia bajo carga es lo que demuestra que las transferencias no crean ni
+destruyen dinero. El ledger se
 mantiene a proposito estrecho (solo aplica debito y credito equilibrados) para
 que ese invariante sea facil de razonar.
 

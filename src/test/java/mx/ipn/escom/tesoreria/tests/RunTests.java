@@ -32,6 +32,7 @@ public final class RunTests {
     public static void main(String[] args) {
         List<Case> cases = new ArrayList<>();
         cases.addAll(new LedgerTest().cases());
+        cases.addAll(new AtomicTotalTest().cases());
         cases.addAll(new MoneyTest().cases());
         cases.addAll(new RequestParserTest().cases());
         cases.addAll(new WireCodecTest().cases());

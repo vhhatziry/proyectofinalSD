@@ -25,7 +25,9 @@ cargar, y cada vez que se refresca, la función \codigo{loadPanel()} hace
 \codigo{fetch("/panel")} pidiendo JSON y, con la respuesta, repinta tres zonas:
 el \emph{hero} (saldo total del cluster, número de cuentas y última transacción,
 tomados del nodo líder), un sello de consistencia que compara los saldos totales
-de los nodos en línea para indicar si el invariante se conserva, y una tarjeta
+de los nodos en línea para indicar si el invariante se conserva (cada total
+proviene del snapshot atomico de \codigo{totalCents()}, así que el sello no
+parpadea por lecturas rotas bajo carga), y una tarjeta
 por nodo. Cada tarjeta dibuja el rol (\codigo{Lider}/\codigo{Replica}), el estado
 (\codigo{Activo}/\codigo{Caido}), el saldo del nodo, los cuatro contadores de
 negocio (cuentas, transferencias, última tx y transacciones en Cloud Storage) y
