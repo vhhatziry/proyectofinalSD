@@ -1,0 +1,225 @@
+\section{Persistencia durable en Cloud Storage}
+
+La durabilidad del mini-banco se apoya en un \emph{log} de transferencias que
+vive en un bucket de Google Cloud Storage. Cada transferencia confirmada por el
+lider termina escrita en esa bitacora, de modo que si caen los tres nodos a la
+vez el lider pueda renacer y reconstruir todos los saldos releyendo el log. Tres
+clases cooperan: \codigo{durable/Journal.java} orquesta la escritura y la
+recuperacion, \codigo{durable/GcsStore.java} habla con la JSON API de Cloud
+Storage y \codigo{durable/GcsAuth.java} obtiene los tokens de acceso. La unidad
+que se persiste es siempre un \codigo{core/Transfer.java}, el mismo registro que
+viaja por el cluster.
+
+\subsection{La bitacora de transacciones}
+
+El \codigo{durable/Journal.java} es un orquestador de durabilidad que solo existe
+en el lider (las replicas nunca poseen un \codigo{Journal}). Implementa la
+interfaz \codigo{core/CommitListener.java}: una vez registrado sobre el banco del
+lider, su metodo \codigo{onCommit(Transfer)} recibe cada transferencia recien
+confirmada. Lo importante es que \emph{no} sube nada a GCS en ese momento: solo
+encola la transferencia y regresa de inmediato. Asi, la respuesta HTTP de una
+transferencia nunca se bloquea esperando un viaje de ida y vuelta a Cloud
+Storage.
+
+\begin{lstlisting}[language=Java,caption={onCommit solo encola; la subida ocurre fuera del hot path}]
+@Override
+public void onCommit(Transfer transfer) {
+    queue.offer(transfer);
+}
+\end{lstlisting}
+
+La cola es un \codigo{BlockingQueue} que un unico hilo de fondo
+(\codigo{journal-writer}, marcado como \emph{daemon}) consume en
+\codigo{drainLoop()}. Ese hilo espera con \codigo{poll(POLL\_MS, ...)} a que
+aparezca una transferencia, y cuando la toma vacia de golpe todo lo que haya
+disponible en la cola hasta un maximo de \codigo{MAX\_BATCH} (1000) con
+\codigo{drainTo}, componiendo un solo lote. El lote completo se sube como un
+unico objeto mediante \codigo{store.putBatch(batch)} y, solo si la subida tuvo
+exito, se avanza el contador \codigo{stored} en el tamano del lote. El agrupado
+por lotes es lo que permite que el log durable siga el ritmo de una tasa alta de
+commits sin un objeto por transferencia.
+
+\begin{lstlisting}[language=Java,caption={drainLoop compone un lote y lo sube como un solo objeto}]
+batch.clear();
+batch.add(first);
+queue.drainTo(batch, MAX_BATCH - 1);
+try {
+    store.putBatch(batch);
+    stored.addAndGet(batch.size());
+} catch (IOException e) {
+    System.err.println("journal: could not persist batch of " + batch.size()
+            + " ending at seq " + batch.get(batch.size() - 1).seq()
+            + ": " + e.getMessage());
+}
+\end{lstlisting}
+
+Cada entrada del log es exactamente un \codigo{core/Transfer.java}: un registro
+inmutable con un numero de secuencia monotono asignado por el ledger al confirmar
+(\codigo{seq}), la cuenta origen (\codigo{from}), la cuenta destino
+(\codigo{to}) y el monto movido en centavos (\codigo{cents}). Es la misma forma
+que serializan el codec del cluster y el journal de GCS.
+
+\begin{lstlisting}[language=Java,caption={La unidad persistida: el registro Transfer (core/Transfer.java)}]
+public record Transfer(long seq, int from, int to, long cents) {
+}
+\end{lstlisting}
+
+El contador \codigo{stored()} reporta cuantas transferencias estan
+\emph{realmente} subidas a GCS; queda por debajo del numero de commits aplicados
+en exactamente la profundidad de la cola, que es la cifra durable que debe
+mostrar el dashboard. Un fallo de subida se registra en \codigo{stderr} pero no
+detiene el hilo: el lazo corre mientras \codigo{running} sea verdadero o quede
+algo en la cola. Un lote cuya subida falla se descarta y deja un hueco en el log
+durable; para que ese hueco no pase inadvertido, \codigo{recover()} valida la
+contiguidad al arrancar (el log es contiguo desde 1) y avisa por \codigo{stderr} si
+una secuencia no es la sucesora esperada, en vez de recuperar en silencio un log
+incompleto.
+
+Esta estrategia asincrona tiene una ventana de durabilidad explicita. En un
+apagado ordenado, \codigo{stop()} pone \codigo{running} en falso y hace
+\codigo{join} al escritor para drenar la cola, de modo que toda transferencia ya
+confirmada quede subida antes de que el proceso termine; \codigo{app/Node.java}
+registra ese \codigo{stop()} como \emph{shutdown hook}. En cambio, una muerte
+abrupta del proceso deja la cola en vuelo como la ventana de durabilidad inherente
+a un journaling asincrono: como el commit responde al cliente antes de subir a
+GCS, una transferencia confirmada puede perderse en un \emph{kill} duro. Ese es
+el precio consciente de mantener Cloud Storage fuera del camino critico.
+
+\subsection{Acceso a Cloud Storage}
+
+El \codigo{durable/GcsStore.java} es un cliente delgado sobre la JSON API REST de
+Cloud Storage, construido directamente con \codigo{java.net.http.HttpClient} y
+sin el SDK de Google. Todos los objetos del journal cuelgan del prefijo
+\codigo{journal/}. El metodo \codigo{put(Transfer)} existe y escribiria una
+transferencia suelta como \codigo{journal/tx-seq.json}, pero el camino vivo no lo
+usa: \codigo{Journal} siempre llama a \codigo{putBatch}, que compone muchas
+transferencias en un solo objeto \codigo{journal/batch-min-max.json} (un arreglo
+JSON), nombrado por la secuencia minima y maxima del lote. Cloud Storage no tiene
+\emph{append}; componer objetos es la alternativa sancionada por el contrato.
+
+Las subidas usan el endpoint de \emph{simple media upload}
+(\codigo{UPLOAD\_BASE}) con \codigo{uploadType=media}, mientras que listar y leer
+usan la JSON API (\codigo{API\_BASE}). Toda peticion lleva la cabecera
+\codigo{Authorization: Bearer} con un token de \codigo{GcsAuth} y se serializa con
+gson. Ademas, \codigo{GcsStore} ofrece \codigo{putCheckpoint}/\codigo{getCheckpoint}
+para que una replica guarde su snapshot bajo el prefijo \codigo{checkpoint/};
+estos quedan deliberadamente fuera de \codigo{journal/} para que el
+\codigo{readAll()} del lider nunca los liste ni intente parsearlos como
+\codigo{Transfer}.
+
+\begin{lstlisting}[language=Java,caption={putBatch compone el lote en un solo objeto journal/batch-min-max.json}]
+long min = batch.stream().mapToLong(Transfer::seq).min().getAsLong();
+long max = batch.stream().mapToLong(Transfer::seq).max().getAsLong();
+String name = PREFIX + "batch-" + min + "-" + max + ".json";
+String url = UPLOAD_BASE + bucket + "/o?uploadType=media&name=" + enc(name);
+HttpRequest request = HttpRequest.newBuilder(URI.create(url))
+        .timeout(HTTP_TIMEOUT)
+        .header("Authorization", "Bearer " + auth.accessToken())
+        .header("Content-Type", "application/json")
+        .POST(HttpRequest.BodyPublishers.ofString(gson.toJson(batch)))
+        .build();
+\end{lstlisting}
+
+Toda peticion pasa por \codigo{sendWithRetry}, que reintenta hasta
+\codigo{MAX\_ATTEMPTS} (3) veces ante un fallo de red transitorio
+(\codigo{IOException}: una conexion caida, un timeout) y, si todos los intentos
+fallan, relanza la excepcion. Esto hace que la recuperacion en frio aborte de
+forma ruidosa en lugar de servir silenciosamente un estado solo-base. Un estado
+HTTP no-2xx no se reintenta: se devuelve al llamador, que decide como tratarlo
+(por ejemplo, \codigo{getCheckpoint} interpreta un 404 como ``aun no existe'' y
+devuelve \codigo{null}).
+
+\subsubsection{Autenticacion con la cuenta de servicio}
+
+El \codigo{durable/GcsAuth.java} acuna tokens de acceso OAuth2 para la JSON API
+usando el flujo de \emph{key-file} de cuenta de servicio, tambien sin SDK de
+Google (el metadata server de la VM no se usa a proposito). En el constructor lee
+el JSON de la cuenta de servicio apuntado por \codigo{TES\_GCS\_KEYFILE} y extrae
+\codigo{client\_email}, \codigo{token\_uri} (con un endpoint por defecto si falta)
+y \codigo{private\_key}, del que reconstruye la llave RSA PKCS8.
+
+Para obtener un token, \codigo{buildAssertion()} arma un JWT con cabecera RS256 y
+un claim set cargado con \codigo{iss}, \codigo{scope}
+(\codigo{devstorage.read\_write}), \codigo{aud}, \codigo{iat} y \codigo{exp}, lo
+firma con \codigo{SHA256withRSA} sobre la llave privada y lo codifica en Base64
+URL sin relleno. No se envia \codigo{sub} (eso es solo para delegacion de
+dominio y aqui seria rechazado como \codigo{unauthorized\_client}).
+
+\begin{lstlisting}[language=Java,caption={Claims del JWT que GcsAuth autofirma (RS256)}]
+JsonObject claims = new JsonObject();
+claims.addProperty("iss", clientEmail);
+claims.addProperty("scope", SCOPE);
+claims.addProperty("aud", tokenUri);
+claims.addProperty("iat", now);
+claims.addProperty("exp", now + TOKEN_TTL_SECONDS);
+\end{lstlisting}
+
+El JWT firmado se intercambia en \codigo{refresh()} por un POST
+\codigo{x-www-form-urlencoded} al \codigo{token\_uri} con el grant
+\codigo{urn:ietf:params:oauth:grant-type:jwt-bearer}, y del cuerpo se lee
+\codigo{access\_token}. \codigo{accessToken()} cachea el token y lo reusa hasta
+poco antes de expirar (margen \codigo{REFRESH\_SKEW\_SECONDS} de 60 s), acunando
+uno nuevo solo cuando hace falta; el metodo es \codigo{synchronized} porque el
+hilo escritor lo consulta en cada subida.
+
+El alta de la cuenta de servicio se hace una sola vez, segun describe
+\codigo{SETUP-GCS.md}: crear la cuenta, otorgarle \codigo{roles/storage.objectAdmin}
+sobre el bucket (no basta \codigo{objectCreator}, porque el log no solo sube sino
+que \emph{relee} en el arranque en frio) y descargar la llave
+\codigo{credentials.json}. Esa llave nunca se sube al repositorio; en la VM se
+copia aparte y se apunta \codigo{TES\_GCS\_KEYFILE} a su ruta, mientras
+\codigo{TES\_BUCKET} lleva el nombre del bucket (solo en el nodo lider).
+
+\subsection{Recuperacion ante desastre total}
+
+Cuando el lider arranca, \codigo{app/Node.java} corre la recuperacion durable
+antes de aceptar trafico, siempre que Cloud Storage este configurado (si faltan
+\codigo{TES\_BUCKET} o \codigo{TES\_GCS\_KEYFILE}, el lider sigue sirviendo todos
+los endpoints en memoria y el journal simplemente no se activa). El arranque crea
+el \codigo{GcsAuth} y el \codigo{GcsStore}, instancia el \codigo{Journal} y llama
+a \codigo{recover}, pasandole \codigo{bank::applyReplicated} como la accion que
+aplica cada transferencia recuperada al ledger.
+
+\begin{lstlisting}[language=Java,caption={Arranque del lider: recuperar, sembrar el contador y registrar el journal (app/Node.java)}]
+GcsAuth auth = new GcsAuth(Path.of(config.gcsKeyfile()));
+GcsStore store = new GcsStore(auth, config.bucket());
+journal = new Journal(store);
+int recovered = journal.recover(bank::applyReplicated);
+journal.start(recovered);
+bank.addCommitListener(journal);
+\end{lstlisting}
+
+Dentro de \codigo{recover(CommitListener apply)}, el journal pide a
+\codigo{store.readAll()} todas las transferencias persistidas y reaplica cada una
+en orden al ledger. El metodo \codigo{readAll()} de \codigo{GcsStore} lista los
+objetos bajo el prefijo \codigo{journal/} (siguiendo la paginacion por
+\codigo{nextPageToken} de la JSON API), baja cada uno y los aplana: si el objeto
+es un arreglo (un lote) expande cada elemento, y si es un objeto suelto lo
+convierte directo. Como cada \codigo{Transfer} carga su \codigo{seq}, el ``donde
+quedo'' no depende del nombre de los objetos ni de un cursor persistido del
+lider: \codigo{readAll()} reordena todo por secuencia al final, asi que el ledger
+se reconstruye exactamente hasta la ultima secuencia confirmada sin huecos ni
+duplicados de orden.
+
+\begin{lstlisting}[language=Java,caption={readAll aplana lotes y transferencias sueltas, y reordena por secuencia (GcsStore)}]
+JsonElement parsed = JsonParser.parseString(response.body());
+if (parsed.isJsonArray()) {
+    for (JsonElement element : parsed.getAsJsonArray()) {
+        transfers.add(gson.fromJson(element, Transfer.class));
+    }
+} else {
+    transfers.add(gson.fromJson(parsed, Transfer.class));
+}
+// ...
+transfers.sort(Comparator.comparingLong(Transfer::seq));
+\end{lstlisting}
+
+Hecha la reaplicacion, \codigo{recover} devuelve cuantas transferencias se
+recuperaron y \codigo{start(recovered)} siembra con ese valor el contador
+\codigo{stored} (para que el dashboard arranque mostrando lo ya durable) y lanza
+el hilo escritor que sube los commits vivos a partir de ese punto. El lider queda
+entonces sirviendo con los saldos completos reconstruidos desde el log, que el
+dashboard muestra como saldos recuperados. La garantia es fuerte para todo lo que
+alcanzo a subirse a GCS y se vio reforzada por el \emph{shutdown hook} que drena
+la cola en un apagado ordenado; lo unico no recuperable es la ventana asincrona
+en vuelo descrita antes, ante una caida abrupta.

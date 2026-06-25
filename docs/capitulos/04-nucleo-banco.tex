@@ -1,0 +1,195 @@
+\section{Nucleo del banco: dinero, ledger e invariante}
+
+El paquete \codigo{core} concentra el dominio del mini-banco: como se representa
+el dinero, donde viven los saldos, como se mueve dinero de una cuenta a otra sin
+condiciones de carrera y que invariante debe respetarse siempre. Es el corazon
+de la rubrica de Consistencia (25 puntos): el saldo global debe conservarse, sin
+inconsistencias, aun bajo carga concurrente. Todo lo que sigue se apoya en una
+decision de diseno simple pero estricta: el dinero nunca se representa con punto
+flotante.
+
+\subsection{Dinero exacto en centavos}
+
+Un saldo jamas se guarda como \codigo{double}: se guarda como un entero de
+centavos (\codigo{long}). Asi se evitan los errores de redondeo binario tipicos
+del punto flotante, donde una cantidad como 0.10 no tiene representacion exacta y
+las sumas acumulan deriva. Al trabajar en centavos enteros, toda operacion
+aritmetica (sumar, restar, comparar) es exacta y reproducible en cualquier nodo.
+
+Por eso los saldos viven como \codigo{long} en \codigo{core/Account.java}
+(campo \codigo{balanceCents}) y los montos de cada transferencia tambien, en el
+campo \codigo{cents} de \codigo{core/Transfer.java}. La clase
+\codigo{core/Money.java} no almacena dinero ni hace aritmetica de saldos: es un
+ayudante estatico (constructor privado, sin instancias) que centraliza la unica
+conversion entre la cadena decimal que ve el humano (con dos decimales) y la
+representacion interna en centavos. Se extrajo a proposito para que los
+endpoints, el cargador de datos y el codec del cluster nunca incrusten
+aritmetica de \codigo{BigDecimal} ad hoc.
+
+La conversion de texto a centavos usa \codigo{BigDecimal} con redondeo
+\codigo{HALF\_UP}, de modo que el parseo nunca introduce error de coma flotante:
+
+\begin{lstlisting}[language=Java,caption={Conversion exacta de decimal a centavos en Money.toCents}]
+public static long toCents(String decimal) {
+    return new BigDecimal(decimal)
+            .movePointRight(2)
+            .setScale(0, RoundingMode.HALF_UP)
+            .longValueExact();
+}
+\end{lstlisting}
+
+El camino inverso, \codigo{Money.toDecimal(long)}, reconstruye la cadena con
+exactamente dos decimales usando \codigo{movePointLeft(2)} y
+\codigo{setScale(2)}. La aritmetica real de mover dinero (la resta del origen y
+la suma al destino) no ocurre en \codigo{Money}, sino en el ledger, sobre esos
+mismos \codigo{long} de centavos.
+
+\subsection{Cuentas y ledger}
+
+Una \codigo{core/Account.java} es una cuenta del banco: su id y su titular
+(\codigo{owner}) son inmutables, y el unico estado mutable es el saldo en
+centavos. Ese saldo solo puede leerse o escribirse manteniendo el monitor
+intrinseco de la propia cuenta; por eso tanto el lector \codigo{balanceCents()}
+como el escritor \codigo{setBalanceCents(long)} estan declarados
+\codigo{synchronized}. No hay un objeto candado por campo: el ledger toma los
+monitores intrinsecos de las dos cuentas que participan en una transferencia,
+ordenados por id, para mantener el protocolo libre de deadlock.
+
+El \codigo{core/Ledger.java} guarda el conjunto de cuentas y realiza la mecanica
+cruda de mover dinero entre dos de ellas; deliberadamente no sabe nada de
+secuencias, log de commits ni replicacion (eso vive en \codigo{Bank}). Las
+cuentas se almacenan en un \codigo{ConcurrentHashMap<Integer, Account>}, de modo
+que las lecturas (\codigo{get}) y el alta de cuentas (\codigo{add}) son libres de
+candado. La consulta de un saldo individual es simplemente
+\codigo{ledger.get(id).balanceCents()}. La suma global se obtiene con
+\codigo{totalCents()}, que recorre todas las cuentas acumulando sus saldos; sin
+movimientos concurrentes ese total es exactamente el valor cargado al inicio, y
+observarlo bajo carga es la forma en que el sistema verifica que las
+transferencias conservan el dinero.
+
+Todos los nodos parten del mismo estado gracias a \codigo{core/Dataset.java},
+que carga el dataset compartido de cuentas en un ledger. El archivo es un CSV
+plano de cuatro columnas sin encabezado
+(\codigo{firstName,lastName1,lastName2,balance}) y sin columna de id: el id de
+cada cuenta es su posicion en el archivo contando desde \codigo{idBase}
+(normalmente 1), asi que la primera linea de datos se parsea, no se omite. El
+titular se forma uniendo los tres campos de nombre con espacios, y el saldo se
+convierte de su texto decimal a centavos enteros con \codigo{Money.toCents}, de
+modo que ningun punto flotante toca jamas un saldo. Como cada nodo lee el mismo
+archivo, todos arrancan con saldos identicos, y por eso la comprobacion de
+conservacion de dinero a lo largo del cluster es significativa.
+
+\subsection{Transferencia atomica}
+
+La orquestacion de una transferencia solicitada por el cliente vive en
+\codigo{Bank.transfer(int, int, long)} de \codigo{core/Bank.java}. El banco
+primero aplica las validaciones que son politica del banco (no mecanica del
+ledger): rechaza una transferencia a la misma cuenta y un monto no positivo.
+Solo si esas comprobaciones pasan, delega el debito y el credito al ledger y, en
+el mismo paso atomico (dentro del candado del movimiento), le asigna el siguiente
+numero de secuencia; luego la registra en el log y la entrega a los listeners:
+
+\begin{lstlisting}[language=Java,caption={Bank.transfer: politica, movimiento delegado y commit}]
+public long transfer(int from, int to, long cents) throws TransferException {
+    if (from == to) {
+        throw TransferException.selfTransfer();
+    }
+    if (cents <= 0L) {
+        throw TransferException.badAmount();
+    }
+    // La secuencia se asigna DENTRO del candado del movimiento (atomica con el).
+    long seq = ledger.move(from, to, cents, sequence::incrementAndGet);
+    Transfer committed = new Transfer(seq, from, to, cents);
+    // ...
+}
+\end{lstlisting}
+
+La parte critica para la consistencia, la atomicidad y la ausencia de deadlock,
+no esta en \codigo{Bank} sino en el metodo privado \codigo{apply} del ledger, al
+que llega \codigo{ledger.move}. Ese metodo busca ambas cuentas y, para mover el
+dinero como un solo paso atomico, toma los dos monitores en un orden fijo
+determinado por el id (siempre el menor primero). Ese orden global es lo que
+impide el deadlock: si dos transferencias inversas tocan el mismo par de cuentas
+en sentidos opuestos, ambas intentan adquirir los candados en la misma
+secuencia, de modo que nunca se bloquean mutuamente esperando candados cruzados.
+
+\begin{lstlisting}[language=Java,caption={Ledger.apply: orden de candados por id y movimiento atomico}]
+Account first = (from < to) ? src : dst;
+Account second = (from < to) ? dst : src;
+synchronized (first) {
+    synchronized (second) {
+        if (enforceFunds && src.balanceCents() < cents) {
+            throw TransferException.lowBalance(from);
+        }
+        src.setBalanceCents(src.balanceCents() - cents);
+        dst.setBalanceCents(dst.balanceCents() + cents);
+        // Estampa la secuencia aqui dentro: el orden de commit coincide
+        // con el orden en que se movio el dinero.
+        return (sequencer != null) ? sequencer.getAsLong() : 0L;
+    }
+}
+\end{lstlisting}
+
+Como ambos monitores se mantienen durante todo el movimiento, el par de saldos
+cambia junto, sin que otro hilo observe un estado intermedio donde el dinero ya
+salio del origen pero aun no entro al destino. El rechazo nunca se devuelve como
+valor de retorno, sino como una \codigo{core/TransferException.java}, una
+excepcion verificada con un \codigo{code()} de un vocabulario pequeno y cerrado:
+\codigo{self\_transfer}, \codigo{bad\_amount}, \codigo{no\_such\_account} y
+\codigo{low\_balance}. Asi un llamador no puede continuar por accidente despues
+de un movimiento rechazado, y la capa HTTP mapea esos codigos a estados y a un
+cuerpo JSON de error. La \codigo{core/Transfer.java} resultante es un
+\codigo{record} inmutable (\codigo{seq}, \codigo{from}, \codigo{to},
+\codigo{cents}): es la unidad de replicacion y durabilidad que el codec del
+cluster y el journal en GCS serializan.
+
+\subsection{Invariante de saldo y numero de secuencia}
+
+El invariante central es la conservacion del dinero: como cada movimiento es un
+debito en una cuenta acompanado de un credito por la misma cantidad en otra, la
+suma global de saldos permanece constante. Ese es precisamente el valor que
+expone \codigo{Ledger.totalCents()}, y su constancia bajo carga es lo que
+demuestra que las transferencias no crean ni destruyen dinero. El ledger se
+mantiene a proposito estrecho (solo aplica debito y credito equilibrados) para
+que ese invariante sea facil de razonar.
+
+El numero de secuencia es la otra mitad de la consistencia, y no vive en el
+ledger sino en \codigo{core/Bank.java}, como un \codigo{AtomicLong sequence}. Es
+monotono y solo avanza en un commit real: la secuencia
+(\codigo{sequence.incrementAndGet()}) se asigna \emph{dentro} del candado del
+movimiento, atomica con el debito y el credito, de modo que una transferencia
+rechazada nunca consume un numero y, ademas, el orden de las secuencias coincide
+con el orden en que el dinero se movio. Eso importa para las replicas: como sirven
+lecturas mientras reproducen en orden de secuencia, estampar la secuencia junto al
+movimiento evita que una cuenta se vea \emph{transitoriamente} en negativo (un
+debito reproducido antes del credito que lo fondea). Esa secuencia, estampada en
+cada \codigo{Transfer}, es la base de la replicacion y de la verificacion de
+consistencia: ordena los commits y permite a una replica saber hasta donde esta al
+dia. En el camino de replica,
+\codigo{Bank.applyReplicated(Transfer)} no genera secuencia nueva sino que la
+recibe con la entrada y eleva los contadores con
+\codigo{accumulateAndGet(t.seq(), Math::max)}, de modo que reaplicar una entrada
+duplicada nunca retrocede el avance.
+
+Cada commit aceptado se registra en el \codigo{core/TransferLog.java}, un
+historial append-only y thread-safe. Conserva la secuencia ordenada de commits
+para que la alimentacion de replicas pueda reproducir el historial de catch-up a
+una replica recien conectada. Las altas ocurren en el camino de commit a la tasa
+plena de transferencias (20\% del trafico del concurso), asi que la lista interna
+es un \codigo{ArrayList} protegido por el monitor del objeto: anexar es O(1)
+amortizado. Una lista copy-on-write seria un error aqui porque copiaria todo el
+arreglo en cada anexion, volviendo la carga sostenida un costo de copia
+cuadratico. Los escaneos de catch-up (\codigo{since}) son raros (solo cuando una
+replica se conecta) y devuelven una copia fresca de la cola que coincide, de modo
+que el llamador la itera sin sostener el candado.
+
+Por ultimo, \codigo{core/CommitListener.java} es la interfaz funcional que
+notifica un commit. Los listeners se registran con \codigo{Bank.addCommitListener}
+y, en el codigo, el fan-out ocurre unicamente en el camino de cliente del lider:
+al final de \codigo{Bank.transfer} se recorre la lista (un
+\codigo{CopyOnWriteArrayList}, para no bloquear el registro) y se invoca
+\codigo{onCommit(committed)} en cada uno, en orden de registro. Los listeners
+concretos son el journal en GCS (durabilidad) y la alimentacion de replicas
+(replicacion en vivo). La via \codigo{applyReplicated} no vuelve a notificar a
+los listeners, porque ya esta consumiendo el flujo del lider y no debe
+re-emitirlo.

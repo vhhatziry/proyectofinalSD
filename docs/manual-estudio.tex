@@ -1,0 +1,100 @@
+% =====================================================================
+%  Tesoreria Distribuida  --  Manual tecnico de ESTUDIO  (Equipo 18)
+%  VERSION DE ESTUDIO -- NO ENTREGAR.
+%  Documento interno para preparar la explicacion del proyecto ante el
+%  profesor. No forma parte de la entrega oficial.
+%
+%  Compilar:  cd ~/hatziry/docs && ./compilar.sh
+%             (o: pdflatex manual-estudio.tex  -- dos veces, por el indice)
+% =====================================================================
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath}
+\usepackage[spanish,es-noshorthands]{babel}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{graphicx}
+\usepackage{enumitem}
+\usepackage{fancyhdr}
+\usepackage[hidelinks]{hyperref}
+
+% ---- Marcador de contenido pendiente (sale en rojo y compila igual) ----
+\newcommand{\pendiente}[1]{{\color{red}\textbf{[PENDIENTE: #1]}}}
+
+% ---- Codigo en linea (clases, metodos, rutas, variables) ----
+\newcommand{\codigo}[1]{\texttt{#1}}
+
+% ---- Colores y estilo de listados de codigo ----
+\definecolor{codegray}{gray}{0.95}
+\definecolor{kw}{RGB}{0,0,180}
+\definecolor{cmt}{RGB}{0,128,0}
+\definecolor{str}{RGB}{163,21,21}
+
+\lstdefinestyle{tes}{
+  backgroundcolor=\color{codegray},
+  basicstyle=\ttfamily\footnotesize,
+  keywordstyle=\color{kw}\bfseries,
+  commentstyle=\color{cmt}\itshape,
+  stringstyle=\color{str},
+  numbers=left, numberstyle=\tiny\color{gray}, numbersep=8pt,
+  showstringspaces=false, breaklines=true, frame=single, tabsize=2,
+  captionpos=b,
+}
+% Lenguaje vacio para listados de JSON/bash/HTTP (la guia usa language=none).
+\lstdefinelanguage{none}{keywords={},sensitive=false,morecomment=[l]{},morestring=[b]"}
+\lstset{style=tes}
+
+% ---- Encabezado / pie ----
+\pagestyle{fancy}\fancyhf{}
+\fancyhead[L]{Tesoreria Distribuida -- Manual de estudio}
+\fancyhead[R]{\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+\fancyfoot[C]{\small\color{red}VERSION DE ESTUDIO -- NO ENTREGAR}
+
+\begin{document}
+
+% ---------------------------- PORTADA -------------------------------
+\begin{titlepage}
+\centering
+\vspace*{3cm}
+{\Huge\bfseries Tesoreria Distribuida\par}
+\vspace{0.6cm}
+{\Large Manual tecnico de estudio\par}
+\vspace{0.3cm}
+{\large Equipo 18 -- Proyecto Final de Sistemas Distribuidos\par}
+\vspace{2.5cm}
+{\large\bfseries\color{red}VERSION DE ESTUDIO -- NO ENTREGAR\par}
+\vspace{0.4cm}
+\begin{minipage}{0.8\textwidth}\centering\normalsize
+Documento interno para entender y poder explicar el sistema ante el
+profesor. \textbf{No} forma parte de la entrega oficial y puede parecerse
+a otra documentacion: es intencional, su unico fin es estudiar.
+\end{minipage}
+\vfill
+{\normalsize Mini banco distribuido en Java puro\\ Paquete \codigo{mx.ipn.escom.tesoreria}\par}
+\end{titlepage}
+
+% ---------------------------- INDICE --------------------------------
+\tableofcontents
+\newpage
+
+% --------------------------- CAPITULOS ------------------------------
+% Cada archivo de capitulos/ es un FRAGMENTO que empieza con \section.
+% El otro agente los rellena leyendo el codigo real (ver PROMPT-AGENTE.md
+% y GUIA.md). Reemplazar cada \pendiente{...} con prosa real.
+
+\input{capitulos/01-arquitectura}
+\input{capitulos/02-arranque-config}
+\input{capitulos/03-servidor-nio}
+\input{capitulos/04-nucleo-banco}
+\input{capitulos/05-seguridad-jwt}
+\input{capitulos/06-api-rest}
+\input{capitulos/07-replicacion}
+\input{capitulos/08-persistencia-gcs}
+\input{capitulos/09-dashboard}
+\input{capitulos/10-carga-pruebas-despliegue}
+
+\end{document}

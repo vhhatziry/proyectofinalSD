@@ -1,0 +1,195 @@
+\section{API REST y endpoints}
+
+Este capítulo documenta el contrato REST del nodo: cada endpoint con su método,
+ruta, cuerpo, respuesta y códigos de estado. Toda la API se sirve sobre el mismo
+router (\codigo{net/Routes.java}) y dos de los endpoints exigen un JWT,
+siguiendo la estructura REST + JWT que pide la rúbrica.
+
+\subsection{Mapa de rutas}
+
+El enrutador vive en \codigo{net/Routes.java}. Es un \emph{router} por método y
+ruta: cada patrón se parte en segmentos separados por \codigo{/} y un segmento
+escrito como \codigo{\{nombre\}} es una variable de un solo segmento; el resto
+debe coincidir por igualdad exacta de cadena (no es coincidencia por prefijo más
+largo). El método \codigo{Routes.match()} resuelve un método y una ruta concreta
+contra las rutas registradas con una semántica clara de tres resultados: si el
+método y la forma de los segmentos coinciden devuelve el \codigo{Endpoint} con
+estado \codigo{200}; si algún patrón coincide con la ruta pero ningún método
+coincide devuelve \codigo{405} (\emph{method not allowed}); y si ningún patrón
+coincide con la ruta devuelve \codigo{404}.
+
+El cableado real de rutas a \emph{endpoints} ocurre en \codigo{app/Node.java},
+mediante llamadas a \codigo{routes.register(...)}. La siguiente tabla resume cada
+endpoint registrado, con su método, ruta, si exige autenticación con \emph{token}
+y su propósito.
+
+\begin{center}
+\begin{tabular}{l l c l}
+\textbf{Método} & \textbf{Ruta} & \textbf{Auth} & \textbf{Propósito} \\
+\hline
+POST & \codigo{/api/register} & No & Crea una credencial de usuario. \\
+POST & \codigo{/api/login} & No & Verifica credencial y emite un JWT. \\
+GET & \codigo{/api/accounts/\{id\}} & Sí & Devuelve el saldo de una cuenta. \\
+POST & \codigo{/api/transactions/transfer} & Sí & Transfiere dinero entre cuentas. \\
+GET & \codigo{/api/stats} & No & Métricas de \emph{este} nodo. \\
+GET & \codigo{/panel} & No & Métricas agregadas del clúster. \\
+GET & \codigo{/} & No & Sirve el tablero de una sola página. \\
+\end{tabular}
+\end{center}
+
+Solo los dos endpoints de negocio (\codigo{/api/accounts/\{id\}} y
+\codigo{/api/transactions/transfer}) exigen un \emph{token} válido; los de
+autenticación y los de monitoreo son públicos. La columna \emph{Auth} se valida
+con \codigo{Authenticator.authorize()} dentro de cada endpoint, no en el router.
+
+\subsection{Autenticacion: register y login}
+
+\subsubsection*{Registro de usuario}
+
+\codigo{api/RegisterEndpoint.java} atiende \codigo{POST /api/register} y crea una
+credencial nueva. Acepta un cuerpo JSON con la forma
+\codigo{\{"username":"...","password":"..."\}}, lo parsea con \codigo{Gson} y
+delega la persistencia en \codigo{Authenticator.signup()}, que cifra la
+contraseña y la guarda en el \codigo{CredentialStore}. El endpoint primero
+verifica el método (responde \codigo{405} si no es \codigo{POST}); si el JSON está
+mal formado o falta \codigo{username}/\codigo{password} responde \codigo{400} con
+\codigo{\{"error":"bad\_request"\}}; si el usuario aún no existía devuelve
+\codigo{201} con \codigo{\{"status":"created"\}}; y si el nombre ya estaba tomado
+devuelve \codigo{409} con \codigo{\{"error":"username\_taken"\}}. La distinción
+entre creado (\codigo{201}) y duplicado (\codigo{409}) la decide directamente el
+valor booleano que regresa \codigo{auth.signup(username, password)}.
+
+\subsubsection*{Inicio de sesión}
+
+\codigo{api/LoginEndpoint.java} atiende \codigo{POST /api/login}: verifica la
+credencial y, en caso de éxito, emite un JWT. Recibe el mismo cuerpo
+\codigo{\{"username":"...","password":"..."\}} y delega en
+\codigo{Authenticator.login()}, que busca la credencial en el
+\codigo{CredentialStore}, compara la contraseña con \codigo{Passwords.matches()} y
+solo si coinciden mina un \emph{token} firmado con \codigo{Tokens.issue()}. Es
+decir, el login valida credenciales reales: si el usuario no existe o la
+contraseña no coincide, \codigo{login()} regresa \codigo{null} y el endpoint
+responde \codigo{401} con \codigo{\{"error":"invalid\_credentials"\}}. Con
+credenciales válidas responde \codigo{200} con \codigo{\{"token":"<jwt>"\}}; un
+JSON mal formado produce \codigo{400} y un método distinto de \codigo{POST}
+produce \codigo{405}. El cliente reutiliza ese \emph{token} en la cabecera
+\codigo{Authorization: Bearer <jwt>} para las operaciones protegidas.
+
+\begin{lstlisting}[language=none,caption={Contrato JSON de POST /api/login (peticion y respuesta)}]
+POST /api/login
+Content-Type: application/json
+
+{"username":"juan","password":"secreto"}
+
+200 OK
+{"token":"<jwt>"}
+
+401 Unauthorized
+{"error":"invalid_credentials"}
+\end{lstlisting}
+
+\subsection{Operaciones de negocio: balance y transfer}
+
+\subsubsection*{Consulta de saldo}
+
+\codigo{api/BalanceEndpoint.java} atiende \codigo{GET /api/accounts/\{id\}} y
+devuelve la instantánea de una cuenta. Exige un JWT válido: lo primero que hace,
+tras descartar métodos distintos de \codigo{GET} (\codigo{405}), es llamar a
+\codigo{auth.authorize(req)}; si regresa \codigo{null} responde \codigo{401}.
+Luego resuelve la variable de ruta \codigo{id} con \codigo{req.pathParam("id")}:
+si no es un entero (no encaja en el patrón \codigo{-?\textbackslash{}d+})
+responde \codigo{400} con \codigo{\{"error":"bad\_id"\}}; si es numérico pero se
+sale del rango de \codigo{int}, o si la cuenta no está registrada, responde
+\codigo{404}. Con una cuenta válida construye el cuerpo con la forma obligatoria
+del contrato, donde las llaves son exactamente \codigo{id}, \codigo{propietario}
+y \codigo{balance}, por ejemplo
+\codigo{\{"id":125,"propietario":"JUAN MOLINAR HERNANDEZ","balance":15750.25\}}.
+Un detalle clave: \codigo{id} y \codigo{balance} deben serializarse como
+\emph{números} JSON (sin comillas); como \codigo{Money.toDecimal()} devuelve un
+\codigo{String}, el saldo se envuelve en un \codigo{BigDecimal} para que
+\codigo{Gson} lo emita como número y no como cadena entre comillas.
+
+\subsubsection*{Transferencia}
+
+\codigo{api/TransferEndpoint.java} atiende \codigo{POST /api/transactions/transfer}
+y mueve dinero entre dos cuentas. También exige JWT (\codigo{401} sin
+\emph{token}) y rechaza métodos distintos de \codigo{POST} (\codigo{405}). El
+cuerpo obligatorio usa la forma
+\codigo{\{"sourceAccountId":"123","targetAccountId":"456","amount":200.00\}},
+donde los identificadores son \emph{cadenas} y \codigo{amount} es decimal. El
+monto decimal se convierte a centavos con \codigo{Money.toCents()} y la operación
+se orquesta en \codigo{Bank.transfer()}, que valida la solicitud, aplica el
+movimiento atómico, estampa un número de secuencia fresco y preserva la
+invariante de conservación. Un éxito devuelve \codigo{200} con
+\codigo{\{"status":"ok","seq":<seq>\}} llevando la secuencia asignada. Un rechazo
+se manifiesta como una \codigo{TransferException}: su \codigo{code()} determina el
+estado, donde \codigo{"no\_such\_account"} mapea a \codigo{404} y el resto de
+códigos (\codigo{"self\_transfer"}, \codigo{"bad\_amount"}, \codigo{"low\_balance"})
+mapean a \codigo{400}, y el cuerpo refleja \codigo{\{"error":<code>\}}. Un JSON
+mal formado, un identificador no numérico o un monto inválido producen
+\codigo{400} con \codigo{\{"error":"bad\_request"\}}.
+
+\begin{lstlisting}[language=none,caption={Contrato JSON de POST /api/transactions/transfer}]
+POST /api/transactions/transfer
+Authorization: Bearer <jwt>
+Content-Type: application/json
+
+{"sourceAccountId":"123","targetAccountId":"456","amount":200.00}
+
+200 OK
+{"status":"ok","seq":42}
+
+400 Bad Request
+{"error":"low_balance"}
+
+404 Not Found
+{"error":"no_such_account"}
+\end{lstlisting}
+
+El mapeo de \codigo{TransferException} a estado HTTP se concentra en pocas
+líneas, copiadas tal cual del endpoint:
+
+\begin{lstlisting}[language=Java,caption={Mapeo de rechazos de transferencia a estado REST en TransferEndpoint.java}]
+} catch (TransferException e) {
+    int status = "no_such_account".equals(e.code()) ? 404 : 400;
+    JsonObject err = new JsonObject();
+    err.addProperty("error", e.code());
+    return Reply.json(status, gson.toJson(err));
+}
+\end{lstlisting}
+
+\subsection{Endpoints de monitoreo}
+
+Tres endpoints alimentan el tablero. Aquí se resumen; su funcionamiento detallado
+se trata en el capítulo 9.
+
+\codigo{api/StatsEndpoint.java} atiende \codigo{GET /api/stats} y reporta las
+métricas de \emph{este} nodo. Serializa la instantánea viva de
+\codigo{NodeStats} llamando a \codigo{stats.toJson()}, que produce un objeto JSON
+con las llaves \codigo{nodeId}, \codigo{role}, \codigo{status},
+\codigo{accountCount}, \codigo{totalBalance}, \codigo{transferCount},
+\codigo{lastTxId}, \codigo{cpuPercent}, \codigo{ramPercent}, \codigo{diskPercent}
+y \codigo{gcsCount} (el número de transacciones almacenadas en Cloud Storage).
+Responde \codigo{405} ante un método distinto de \codigo{GET}.
+
+\codigo{api/PanelEndpoint.java} atiende \codigo{GET /panel} y agrega las métricas
+de todo el clúster. Combina la instantánea local (\codigo{stats.toJson()}) con las
+métricas que obtiene por HTTP del endpoint \codigo{/api/stats} de cada par
+listado en \codigo{TES\_PEERS} (vía \codigo{NodeConfig}), y produce un único
+documento JSON con la forma \codigo{\{"nodes":[...]\}}, una entrada por nodo, para
+que el tablero dibuje el clúster en una sola página. Cada par se consulta de forma
+concurrente con un \codigo{HttpClient} de \emph{timeout} acotado; un par
+inalcanzable o lento no tumba la respuesta: se reporta como nodo caído
+(\codigo{"status":"down"}) en lugar de fallar todo el panel. Además recuerda el
+último \codigo{nodeId} que cada par reportó mientras estuvo arriba, de modo que la
+tarjeta de un nodo caído conserve su identidad real durante la demostración de
+tolerancia a fallos.
+
+\codigo{api/DashboardEndpoint.java} atiende \codigo{GET /} y sirve el tablero de
+una sola página: transmite el recurso \codigo{dashboard.html} desde el
+\emph{classpath} como respuesta HTML. La propia página sondea \codigo{/panel} (y
+ofrece un control de \emph{Refresh}) para mostrar el estado de cada nodo, su
+número de cuentas, el saldo total, el número de transferencias, el id de la
+última transacción, \%CPU, \%RAM, \%Disco y el conteo de transacciones en Cloud
+Storage. Responde \codigo{405} ante un método distinto de \codigo{GET} y
+\codigo{404} si el recurso HTML no existe.

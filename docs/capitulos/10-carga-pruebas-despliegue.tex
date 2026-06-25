@@ -1,0 +1,287 @@
+\section{Generador de carga, pruebas y despliegue}
+
+Este capítulo cierra el manual con la cara operativa del sistema: cómo se le
+inyecta carga para medirlo, cómo se prueba su lógica con un arnés en Java puro y
+cómo se despliega y se opera el clúster sobre Google Cloud el día de la
+evaluación.
+
+\subsection{Generador de carga}
+
+El generador de carga vive en \codigo{loadtest/LoadDriver.java}, una clase
+\emph{stand-alone} que es el único ``cliente'' del proyecto: no depende de nada
+del servidor más allá del contrato REST publicado. Genera tráfico contra un solo
+nodo (el líder) durante una duración fija mezclando un \textbf{80\% de lecturas
+de saldo y un 20\% de transferencias}, proporción gobernada por la constante
+\codigo{READ\_RATIO = 0.80}. Por defecto corre \codigo{DEFAULT\_SECONDS = 60}
+segundos con \codigo{DEFAULT\_CLIENTS = 8} hilos concurrentes, pero los
+argumentos de \codigo{main} permiten fijar segundos, hilos y el rango de cuentas
+\codigo{[minId, maxId]}; subiendo los segundos puede correr de forma
+prácticamente indefinida, como exige la prueba del profesor que ``nunca
+termina''.
+
+Antes de medir, \codigo{bootstrapToken()} registra un usuario desechable
+(\codigo{loaddriver}) y hace \codigo{login} para obtener el JWT que comparten
+todos los hilos; tanto un \codigo{201} (creado) como un \codigo{409} (ya
+registrado) son aceptables porque solo se necesita poder iniciar sesión. Un
+detalle de rendimiento importante es que \emph{un} único \codigo{HttpClient}
+(\codigo{sharedClient}) se reparte entre todos los \emph{workers}: un cliente por
+hilo abriría cientos de hilos selectores propios y el generador se ahogaría en su
+propio \emph{context-switch} antes de saturar al banco.
+
+Cada hilo es un \codigo{Worker} que, hasta una fecha límite común en
+\codigo{System.nanoTime()}, sortea la operación según \codigo{READ\_RATIO} y la
+despacha. Solo se cuentan los éxitos reales: \codigo{doRead()} incrementa
+\codigo{reads} únicamente si el servidor devolvió \codigo{HTTP 200} con un saldo
+parseable, y \codigo{doTransfer()} incrementa \codigo{transfers} solo si la
+transferencia fue aceptada (también \codigo{200}).
+
+\begin{lstlisting}[language=Java,caption={Bucle de carga por hilo (Worker.run, recortado)}]
+public void run() {
+    HttpClient http = sharedClient;
+    try {
+        while (System.nanoTime() < deadlineNanos) {
+            if (ThreadLocalRandom.current().nextDouble() < READ_RATIO) {
+                doRead(http);
+            } else {
+                doTransfer(http);
+            }
+        }
+    } finally {
+        done.countDown();
+    }
+}
+\end{lstlisting}
+
+La parte didácticamente más valiosa es la verificación de la invariante de
+conservación del dinero. Antes de arrancar la carga,
+\codigo{captureTotalCents()} lee \codigo{GET /api/stats} una sola vez y guarda
+\codigo{totalBalance} (en centavos): leer el total que el servidor suma en
+memoria es O(1) en el cliente, en lugar de sumar cientos de miles de saldos por
+HTTP. Al terminar, \codigo{verifyAndReport()} vuelve a leer el total y exige que
+sea \textbf{idéntico} al inicial: ninguna transferencia crea ni destruye dinero,
+así que la suma global debe permanecer constante. Si no coincide,
+\codigo{reportCulprit()} recorre el rango buscando la cuenta con saldo negativo
+para señalar al culpable; si coincide, imprime \codigo{CONSISTENT} junto con las
+lecturas, las transferencias y el \codigo{score = transferencias*4 + lecturas}
+(una transferencia vale cuatro veces una lectura, según el PDF del concurso).
+
+\begin{lstlisting}[language=Java,caption={Verificacion de la invariante de conservacion (verifyAndReport, recortado)}]
+void verifyAndReport(long initialTotalCents, String scenario) {
+    long finalTotalCents = captureTotalCents();
+    if (finalTotalCents != initialTotalCents) {
+        System.out.println("INCONSISTENT: expected " + initialTotalCents
+                + " cents, found " + finalTotalCents + " cents");
+        reportCulprit(initialTotalCents, finalTotalCents);
+        return;
+    }
+    long score = transfers.get() * 4 + reads.get();
+    System.out.println("CONSISTENT");
+    // ...
+}
+\end{lstlisting}
+
+El cuerpo de la transferencia respeta la forma de cable obligatoria:
+\codigo{transferBody()} serializa \codigo{sourceAccountId} y
+\codigo{targetAccountId} como cadenas y \codigo{amount} como decimal; los montos
+salen de \codigo{randomAmount()} en el rango \codigo{[0.01, 100.00]}, valores
+bajos a propósito para que las transferencias rara vez agoten una cuenta y el
+tráfico no degenere en puros rechazos por saldo insuficiente.
+
+\subsection{Harness de pruebas}
+
+El proyecto no usa JUnit: trae su propio arnés de pruebas en Java puro, formado
+por dos piezas. \codigo{tests/Assert.java} es un ayudante mínimo de aserciones
+(\codigo{isTrue}, \codigo{equals}, \codigo{notNull}, \codigo{throwsException})
+donde cada método lanza un \codigo{AssertionError} con un mensaje descriptivo
+cuando la expectativa falla. \codigo{tests/RunTests.java} es el punto de entrada:
+instancia cada \emph{suite}, ejecuta sus casos y, capturando el
+\codigo{AssertionError}, marca cada caso como \codigo{PASS} o \codigo{FAIL} sin
+detener a los demás. Un caso es un \codigo{record Case(String name, Runnable
+body)}, de modo que la falla se expresa simplemente lanzando una excepción desde
+el cuerpo. Al final imprime un resumen \codigo{total/passed/failed} y termina con
+estatus distinto de cero si algo falló, de manera que sirve para frenar la
+compilación.
+
+\begin{lstlisting}[language=Java,caption={Recoleccion y ejecucion de suites (RunTests.main, recortado)}]
+List<Case> cases = new ArrayList<>();
+cases.addAll(new LedgerTest().cases());
+cases.addAll(new MoneyTest().cases());
+cases.addAll(new RequestParserTest().cases());
+cases.addAll(new WireCodecTest().cases());
+cases.addAll(new AuthTest().cases());
+cases.addAll(new ReplayTest().cases());
+cases.addAll(new CheckpointTest().cases());
+cases.addAll(new JwtCrossNodeTest().cases());
+cases.addAll(new CatchupTest().cases());
+// ... corre cada caso, cuenta PASS/FAIL y hace System.exit(1) si hubo fallos
+\end{lstlisting}
+
+Las \emph{suites} están organizadas por subsistema. \codigo{tests/MoneyTest.java}
+verifica que el dinero se redondee y convierta correctamente entre cadena decimal
+y centavos (con \codigo{HALF\_UP}) y que el viaje de ida y vuelta sea exacto.
+\codigo{tests/LedgerTest.java} comprueba que \codigo{Ledger.move} transfiera
+centavos exactos entre dos cuentas y mantenga el total constante bajo
+concurrencia. \codigo{tests/RequestParserTest.java} valida que el parser arme una
+petición tanto en una sola entrega como partida entre varias.
+\codigo{tests/WireCodecTest.java} cubre la codificación de una transferencia a una
+línea JSON y su \emph{round-trip}. \codigo{tests/AuthTest.java} prueba la
+autorización del \codigo{Authenticator}: el esquema \codigo{Bearer} es
+insensible a mayúsculas (RFC 7235) y tolera espacios, mientras que un encabezado
+ausente, un esquema equivocado o un token vacío o falso se rechazan.
+
+El bloque de mayor valor para este sistema distribuido son las pruebas de
+recuperación y de réplica. \codigo{tests/ReplayTest.java} fija el contrato de
+\codigo{Bank.applyReplicated()}: un seguidor reproduce en orden de secuencia y debe
+\emph{forzar} la aplicación de cada transferencia (ya fue autorizada por el líder)
+en vez de re-verificar fondos, porque re-verificar podría rechazar y
+\emph{descartar} una transferencia autorizada mientras los contadores avanzan,
+divergiendo de forma permanente; aplicar incondicionalmente es independiente del
+orden y por tanto convergente. La \emph{suite} alimenta una secuencia en orden
+adverso, comprueba la convergencia y que un reenvío de una secuencia ya vista sea
+idempotente. \codigo{tests/CheckpointTest.java} cubre las
+primitivas de \emph{checkpoint} que permiten a una réplica reanudar desde su
+secuencia exacta tras un reinicio total: \codigo{Bank.snapshotInto} (captura
+atómica de marca de agua y saldos), \codigo{Bank.seedLastSeq} (siembra la marca
+desde un \emph{checkpoint} restaurado) y la garantía de que un \emph{snapshot}
+restaurado más el delta del líder converge exactamente a los saldos por cuenta
+del líder. \codigo{tests/CatchupTest.java} fija la reanudación por secuencia exacta:
+que \codigo{log.since(X)} sea justamente la cola \codigo{X+1..} y que un banco
+sembrado en la marca \codigo{X} descarte los reenvíos \codigo{<=X} y aplique desde
+\codigo{X+1}. \codigo{tests/JwtCrossNodeTest.java} fija la propiedad entre nodos del
+JWT: un token emitido con el secreto compartido valida en otro nodo y uno firmado
+con un secreto distinto se rechaza.
+
+Existen además dos verificaciones de integración que \textbf{no} corre
+\codigo{RunTests} porque abren un socket real:
+\codigo{tests/ReplConsistency.java} cablea un \codigo{Bank} líder con uno réplica
+sobre \codigo{ReplicaFeed} y \codigo{ReplicaSync}, lo martilla con varios hilos
+escritores haciendo miles de transferencias concurrentes y luego exige que el
+saldo \textbf{por cuenta} líder $=$ réplica para cada cuenta (la suma global se
+conserva aun si una transferencia se pierde o se duplica, así que solo la
+comparación por cuenta atrapa un \emph{bug} de replicación). \codigo{tests/ReplInversion.java}
+es la regresión de la convergencia por cuenta bajo carga concurrente con saldos
+deliberadamente ajustados y montos de hasta el saldo completo -- la ruta que
+originalmente expuso el \emph{bug} de inversión de secuencia --, que
+\codigo{ReplConsistency} no ejercita porque sus cuentas arrancan demasiado holgadas. Cada una imprime \codigo{REPL\_CONSISTENCY\_OK} o
+\codigo{REPL\_INVERSION\_OK} y sale con \codigo{0} en éxito; se ejecutan a mano
+con el \emph{fat jar} en el \emph{classpath}.
+
+\subsection{Despliegue en GCP}
+
+La infraestructura se aprovisiona con \codigo{deploy/crear-infra.sh}, que crea en
+Google Cloud (zona \codigo{us-central1-a}) una IP estática para el líder, las
+reglas de \emph{firewall} (puerto \codigo{8080} abierto a clientes y
+\emph{dashboard}, \codigo{9090} solo entre nodos con la etiqueta
+\codigo{tesoreria}) y exactamente \textbf{2x \codigo{e2-standard-2} + 1x
+\codigo{e2-standard-4}}, respetando la restricción de usar solo la serie E2. Los
+tres nodos arrancan el \emph{mismo} \codigo{deploy/startup-script.sh} y difieren
+únicamente por metadatos por nodo: \codigo{tes-node-id}, \codigo{tes-leader-host},
+\codigo{tes-peers} y un \codigo{tes-jwt-secret} compartido. La convención clave es
+que un \codigo{tes-leader-host} \emph{vacío} marca al nodo como líder (que recibe
+la IP estática); las réplicas lo siguen por su nombre vía el DNS interno de la
+VPC.
+
+\begin{lstlisting}[language=none,caption={Creacion del cluster: 1 lider e2-standard-4 + 2 replicas e2-standard-2 (crear-infra.sh, recortado)}]
+# Leader: empty tes-leader-host marks it the leader; it gets the static IP.
+create_node "${LEADER}" "e2-standard-4" "" "${REPLICA_A}:${HTTP_PORT},${REPLICA_B}:${HTTP_PORT}" \
+    --address="${LEADER_IP}"
+# Replicas: follow the leader by name; e2-standard-2 each.
+create_node "${REPLICA_A}" "e2-standard-2" "${LEADER}" "${LEADER}:${HTTP_PORT},${REPLICA_B}:${HTTP_PORT}"
+create_node "${REPLICA_B}" "e2-standard-2" "${LEADER}" "${LEADER}:${HTTP_PORT},${REPLICA_A}:${HTTP_PORT}"
+\end{lstlisting}
+
+En cada arranque, \codigo{startup-script.sh} corre como \emph{root} y hace cuatro
+cosas: instala el \emph{runtime} \codigo{openjdk-17-jre-headless}; descarga desde
+Cloud Storage el \emph{fat jar}, el \emph{dataset} \codigo{alumnos.csv}, la unidad
+\codigo{node.service} y la llave \codigo{gcs-key.json}; escribe el archivo de
+entorno \codigo{/etc/tesoreria/node.env} con las variables \codigo{TES\_*}
+leídas de los metadatos (entre ellas \codigo{TES\_NODE\_ID},
+\codigo{TES\_PEERS}, \codigo{TES\_LEADER\_HOST}, \codigo{TES\_JWT\_SECRET} y
+\codigo{TES\_BUCKET}); e instala y arranca la unidad \emph{systemd}. Que el mismo
+script sirva para todos los roles es lo que mantiene la operación simple: la
+diferencia líder/réplica se infiere de \codigo{TES\_LEADER\_HOST}.
+
+La unidad \codigo{deploy/node.service} lanza el \emph{jar} con el puerto HTTP
+como primer argumento (\codigo{ExecStart=/usr/bin/java -jar
+.../tesoreria-distribuida.jar 8080}), lee el entorno de
+\codigo{/etc/tesoreria/node.env} y reinicia \codigo{on-failure} para que un nodo
+caído reingrese al clúster automáticamente. Lo \textbf{más importante} de esta
+unidad es su política de apagado: usa \codigo{KillSignal=SIGTERM} con
+\codigo{TimeoutStopSec=120} para que la JVM ejecute sus \emph{shutdown hooks}. Un
+apagado \emph{graceful} con SIGTERM dispara, en una réplica, la escritura del
+\emph{checkpoint} exacto (de ahí depende la garantía de reanudar desde la
+secuencia precisa) y, en el líder, el drenado de la cola del \emph{journal}
+durable. Por eso conviene distinguir reiniciar el \emph{proceso} de reiniciar la
+\emph{VM}: matar el proceso con SIGTERM (o \codigo{systemctl stop}) preserva el
+estado y el \emph{checkpoint}; nunca debe usarse \codigo{kill -9}, que cortaría la
+escritura del \emph{checkpoint} a media subida.
+
+\begin{lstlisting}[language=none,caption={Apagado graceful que preserva el checkpoint (node.service, recortado)}]
+KillSignal=SIGTERM
+TimeoutStopSec=120
+\end{lstlisting}
+
+El ciclo de vida del despliegue se cubre con scripts cortos para no gastar
+cómputo cuando no se usa: la infraestructura normalmente está apagada y el día de
+la revisión basta \codigo{deploy/encender.sh} para arrancar las cuatro VMs (los
+tres nodos más el \codigo{generador}) y esperar a que el líder cargue las 820k
+cuentas y sirva \codigo{/api/stats}, sondeándolo con reintentos de \codigo{curl}.
+Al terminar, \codigo{deploy/apagar.sh} detiene las VMs sin borrarlas (pausa el
+gasto) y \codigo{deploy/destruir-infra.sh} elimina todo, incluidos discos e IP
+estática, para no dejar ningún costo. La IP estática del líder no cambia al
+apagar y encender, así que el punto de entrada único es estable.
+
+\subsection{Operacion el dia del concurso}
+
+El guion de la demo en vivo está en \codigo{deploy/RUNBOOK.md}, organizado como
+\textbf{encender $\rightarrow$ demostrar $\rightarrow$ apagar}. El paso 0 levanta
+el clúster con \codigo{encender.sh} y abre el \emph{dashboard} en
+\codigo{http://34.67.240.245:8080/} (la IP estática del líder). El paso 1 ejercita
+a mano los cuatro \emph{endpoints} con JWT (\codigo{/api/register},
+\codigo{/api/login}, \codigo{/api/accounts/\{id\}} y
+\codigo{/api/transactions/transfer}) para mostrar sus formas exactas, y el paso 2
+demuestra la invariante de conservación: \codigo{totalBalance} en
+\codigo{/api/stats} debe quedar constante en \codigo{410113948069.86} antes y
+después de transferir.
+
+El corazón de la evaluación es la tolerancia a fallos (pasos 3 y 4). Se demuestra
+el ``mata-proceso'' apagando primero \codigo{nodo-3} y luego \codigo{nodo-2} con
+\codigo{gcloud compute instances stop}: el líder \textbf{sigue sirviendo} aunque
+caigan las dos réplicas. Después se revive una réplica y se observa en su
+\emph{log} que reanuda desde su secuencia \emph{exacta} (no desde cero), gracias
+al \emph{checkpoint} que escribió al apagarse con SIGTERM, y que converge al líder
+(mismo \codigo{lastTxId} y mismo \codigo{totalBalance}). El \emph{dashboard}
+muestra todo el tiempo, por nodo, su estado, \#cuentas, saldo total,
+\#transferencias, última tx y uso de CPU/RAM/disco, conservando los saldos.
+
+\begin{lstlisting}[language=none,caption={Revivir una replica y verificar reanudacion por secuencia (RUNBOOK paso 4, recortado)}]
+$GC compute instances start nodo-2 --zone=$ZONE     # revive
+# en su log se ve que reanuda desde su secuencia EXACTA (no desde 0):
+#   -> [checkpoint] restored checkpoint/nodo-2.json at watermark <N>
+#   -> [node] replica resuming at sequence <N>
+\end{lstlisting}
+
+La medición del concurso se automatiza con \codigo{deploy/concurso.sh}, que corre
+el \codigo{LoadDriver} \textbf{desde la VM generador} (baja latencia contra la IP
+interna del líder) en tres escenarios encadenados, apagando una réplica entre uno
+y otro: escenario 1 con el clúster completo (3 nodos), escenario 2 con líder $+$ 1
+réplica y escenario 3 solo con el líder. Cada escenario verifica la invariante
+(\codigo{CONSISTENT}) e imprime lecturas, transferencias y su
+\codigo{score = transferencias*4 + lecturas}; el script suma los tres
+\emph{scores} en un total. Que las tres corridas terminen \codigo{CONSISTENT} aun
+cruzando apagados de réplicas es la prueba operativa de que el clúster no pierde
+ni inventa dinero bajo fallos.
+
+\begin{lstlisting}[language=none,caption={Un escenario del concurso sobre el generador (concurso.sh, recortado)}]
+out="$(SSH_GEN "java -cp /opt/tesoreria-distribuida.jar mx.ipn.escom.tesoreria.loadtest.LoadDriver ${LEADER_INT} 8080 ${SECONDS_RUN} ${THREADS} 1 820000 ${label} 2>&1")"
+echo "${out}" | grep -E 'CONSISTENT|INCONSISTENT|successful|score' >&2
+\end{lstlisting}
+
+Para cerrar, el RUNBOOK documenta la recuperación ante desastre total: como el
+estado durable vive en Cloud Storage, un arranque en frío de los nodos (incluso
+tras destruir las VMs y volver a crearlas) reconstruye el banco desde el bucket.
+La limpieza final del día es \codigo{deploy/apagar.sh} para solo pausar el gasto,
+o \codigo{deploy/destruir-infra.sh} para borrar discos e IP estática y no dejar
+ningún costo. El RUNBOOK advierte además que las réplicas siempre se apaguen con
+SIGTERM y nunca con \codigo{kill -9}, para no truncar la escritura del
+\emph{checkpoint}.

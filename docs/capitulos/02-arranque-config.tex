@@ -1,0 +1,210 @@
+\section{Arranque y configuracion del nodo}
+
+\subsection{Build: fat jar con Maven}
+
+El proyecto se compila con Maven y produce un \emph{fat jar} ejecutable
+descrito en \codigo{pom.xml}. El artefacto es \codigo{tesoreria-distribuida}
+version \codigo{1.0.0}, empaquetado como \codigo{jar} y compilado contra Java~17
+(\codigo{maven.compiler.release} = 17). El comando habitual es
+\codigo{mvn clean package}, que dispara el plugin
+\codigo{maven-assembly-plugin} (version 3.7.1) con el descriptor
+\codigo{jar-with-dependencies}: ese descriptor reune el codigo del nodo y todas
+sus dependencias en un solo jar autocontenido cuyo manifiesto fija la clase
+principal \codigo{mx.ipn.escom.tesoreria.app.Node}. Asi un unico jar arranca
+indistintamente como lider o como replica, segun las variables de entorno.
+
+\begin{lstlisting}[language=none,caption={Plugin assembly: fat jar y clase principal (pom.xml)}]
+<artifactId>maven-assembly-plugin</artifactId>
+<version>3.7.1</version>
+<configuration>
+    <descriptorRefs>
+        <descriptorRef>jar-with-dependencies</descriptorRef>
+    </descriptorRefs>
+    <archive>
+        <manifest>
+            <mainClass>mx.ipn.escom.tesoreria.app.Node</mainClass>
+        </manifest>
+    </archive>
+</configuration>
+\end{lstlisting}
+
+El sistema es Java puro, sin frameworks: la lista de dependencias declaradas se
+limita a tres bibliotecas, \codigo{org.mindrot:jbcrypt:0.4} (hash de
+contrasenas), \codigo{com.auth0:java-jwt:4.3.0} (emitir y validar JWT) y
+\codigo{com.google.code.gson:gson:2.13.1} (parseo de JSON). Es importante para
+la rubrica que el \codigo{pom.xml} \emph{no} traiga ningun driver JDBC ni base
+de datos embebida: el requisito de usar un SGBD se cumple con cero, porque el
+estado vive en memoria (el ledger) y la durabilidad se resuelve contra Cloud
+Storage. De hecho el comentario del propio \codigo{pom.xml} aclara que no se
+permite el SDK de Google Cloud, y que GCS se alcanza por su API REST JSON cruda
+usando \codigo{java.net.http.HttpClient}.
+
+\subsection{Punto de entrada: Node}
+
+La clase \codigo{app/Node.java} es el punto de entrada del proceso. Su
+\codigo{main()} recibe opcionalmente el puerto HTTP como \codigo{args[0]} (por
+defecto 8080) y orquesta el arranque en una secuencia fija. Primero lee la
+configuracion con \codigo{NodeConfig.fromEnv()}; despues carga el dataset de
+cuentas en un \codigo{Ledger} nuevo con
+\codigo{Dataset.loadInto(ledger, ...)} y, si la carga devuelve cero cuentas,
+falla de inmediato con \codigo{IllegalStateException} en vez de servir un ledger
+vacio (sintoma tipico de un CSV ausente o truncado). El ledger ya poblado se
+envuelve en un \codigo{Bank}, que es quien posee la secuencia de \emph{commits}
+y el reparto a los \codigo{CommitListener}.
+
+\begin{lstlisting}[language=Java,caption={Inicio de Node.main(): config, dataset y bank}]
+int port = (args.length > 0) ? Integer.parseInt(args[0]) : 8080;
+
+NodeConfig config = NodeConfig.fromEnv();
+
+Ledger ledger = new Ledger();
+int loaded = Dataset.loadInto(ledger, Path.of(config.datasetPath()), config.idBase());
+if (loaded <= 0) {
+    throw new IllegalStateException("dataset loaded 0 accounts from "
+            + config.datasetPath() + "; refusing to start with an empty ledger");
+}
+// ...
+Bank bank = new Bank(ledger);
+\end{lstlisting}
+
+A continuacion el nodo se ramifica segun su rol, determinado por
+\codigo{config.isLeader()}. Si es \textbf{lider} y hay Cloud Storage configurado
+(\codigo{TES\_GCS\_KEYFILE} y \codigo{TES\_BUCKET}), construye un
+\codigo{GcsStore} y un \codigo{Journal}, ejecuta la recuperacion en frio con
+\codigo{journal.recover(bank::applyReplicated)} para reaplicar las
+transferencias durables, registra el journal como \codigo{CommitListener} y
+agrega un \emph{shutdown hook} que drena la cola durable al apagar. Tambien
+levanta el \codigo{ReplicaFeed} en el puerto de replicacion y lo registra como
+otro listener, de modo que cada commit en vivo se transmita por TCP a las
+replicas conectadas. Si es \textbf{replica}, opcionalmente restaura su
+\codigo{ReplicaCheckpoint} desde GCS \emph{antes} de iniciar la replicacion (para
+que el \codigo{CATCHUP} arranque desde la marca exacta ya aplicada y no desde 0),
+y luego un \codigo{ReplicaSync} se pone al dia desde el lider y aplica los
+commits en vivo a traves del banco.
+
+Por ultimo, \codigo{main()} arma la pila de seguridad
+(\codigo{Tokens}, \codigo{CredentialStore}, \codigo{Authenticator}), construye el
+proveedor de metricas \codigo{NodeStats}, registra la tabla de rutas con las
+rutas exactas del contrato y arranca el servidor. La ultima linea bloquea el
+hilo principal mientras los reactores y los workers atienden las peticiones.
+
+\begin{lstlisting}[language=Java,caption={Tabla de rutas y arranque del servidor (Node.main())}]
+Routes routes = new Routes();
+routes.register("POST", "/api/register", new RegisterEndpoint(authenticator));
+routes.register("POST", "/api/login", new LoginEndpoint(authenticator));
+routes.register("GET", "/api/accounts/{id}", new BalanceEndpoint(authenticator, ledger));
+routes.register("POST", "/api/transactions/transfer", new TransferEndpoint(authenticator, bank));
+routes.register("GET", "/api/stats", new StatsEndpoint(stats));
+routes.register("GET", "/panel", new PanelEndpoint(stats, config));
+routes.register("GET", "/", new DashboardEndpoint());
+
+Server server = new Server(port, routes, config.workers(), config.reactors());
+server.start();
+
+// Block the main thread while the IoLoop and workers serve requests.
+Thread.currentThread().join();
+\end{lstlisting}
+
+El proveedor de metricas se instancia como
+\codigo{NodeStats(ledger, bank, journal, config)} (ver \codigo{app/NodeStats.java}):
+toma el numero de cuentas y el saldo total del \codigo{Ledger}, el conteo de
+transferencias y el ultimo id del \codigo{Bank}, y el conteo en GCS del
+\codigo{Journal} (que vale 0 en las replicas, donde el journal es null). Las
+metricas de host (CPU, RAM, disco) se leen con Java crudo desde
+\codigo{/proc/stat}, \codigo{/proc/meminfo} y el sistema de archivos, sin
+bibliotecas externas.
+
+\subsection{Configuracion por entorno (TES\_*)}
+
+Toda la configuracion del nodo se inyecta por variables de entorno con prefijo
+\codigo{TES\_}, leidas una sola vez en \codigo{NodeConfig.fromEnv()} dentro de
+\codigo{app/NodeConfig.java}. El rol se deriva de \codigo{TES\_LEADER\_HOST}:
+vacio o ausente significa que el proceso es el \textbf{lider} (nodo-1); cualquier
+otro valor nombra al host del lider que esta \textbf{replica} debe seguir. El
+secreto \codigo{TES\_JWT\_SECRET} debe ser el MISMO en los tres nodos para que un
+token emitido en cualquiera valide en todos. La siguiente tabla resume cada
+variable con su significado y su valor por defecto (los defaults vienen de las
+constantes \codigo{DEFAULT\_*} de la clase).
+
+\begin{center}
+\begin{tabular}{|l|l|p{6.4cm}|}
+\hline
+\textbf{Variable} & \textbf{Default} & \textbf{Significado} \\
+\hline
+\codigo{TES\_DATASET} & (ninguno) & Ruta al CSV de cuentas que carga el nodo. \\
+\codigo{TES\_JWT\_SECRET} & (ninguno) & Secreto HMAC para firmar/validar JWT; identico en los 3 nodos. \\
+\codigo{TES\_NODE\_ID} & (ninguno) & Identificador legible del nodo, p.ej. \codigo{nodo-1}. \\
+\codigo{TES\_PEERS} & \codigo{""} & URLs base de los pares, separadas por coma, para la agregacion del panel. \\
+\codigo{TES\_LEADER\_HOST} & \codigo{""} & Host del lider a seguir; vacio = este nodo ES el lider. \\
+\codigo{TES\_REPL\_PORT} & 9090 & Puerto TCP del feed de replicacion del lider. \\
+\codigo{TES\_BUCKET} & (ninguno) & Bucket de Cloud Storage para el journal durable. \\
+\codigo{TES\_GCS\_KEYFILE} & (ninguno) & Ruta al key file de la cuenta de servicio para autenticar contra GCS. \\
+\codigo{TES\_WORKERS} & 16 & Tamano del pool de hilos que procesan peticiones. \\
+\codigo{TES\_ID\_BASE} & 1 & Id asignado a la primera cuenta del dataset. \\
+\codigo{TES\_REPLICA\_CHECKPOINT\_INTERVAL\_SECS} & 10 & Segundos entre flushes del checkpoint de la replica a GCS. \\
+\codigo{TES\_REPLICA\_CHECKPOINT\_PATH} & (deriva) & Nombre del objeto del checkpoint; si es null usa \codigo{checkpoint/<nodeId>.json}. \\
+\codigo{TES\_REACTORS} & 1 por CPU & Numero de reactores (selectores) del servidor HTTP. \\
+\hline
+\end{tabular}
+\end{center}
+
+La lectura usa dos ayudantes privados: \codigo{env(nombre, def)} devuelve el
+default cuando la variable esta ausente o vacia, e \codigo{intEnv(nombre, def)}
+parsea un entero y cae al default si la variable falta o no es numerica. El
+metodo \codigo{isLeader()} centraliza la decision de rol: devuelve \codigo{true}
+cuando \codigo{leaderHost} es null, vacio o solo espacios en blanco.
+
+\begin{lstlisting}[language=Java,caption={Lectura de las variables TES\_* en NodeConfig.fromEnv()}]
+public static NodeConfig fromEnv() {
+    return new NodeConfig(
+            env("TES_DATASET", null),
+            env("TES_JWT_SECRET", null),
+            env("TES_NODE_ID", null),
+            env("TES_PEERS", ""),
+            env("TES_LEADER_HOST", ""),
+            intEnv("TES_REPL_PORT", DEFAULT_REPL_PORT),
+            // ...
+            intEnv("TES_WORKERS", DEFAULT_WORKERS),
+            intEnv("TES_ID_BASE", DEFAULT_ID_BASE),
+            // ...
+            intEnv("TES_REACTORS", DEFAULT_REACTORS));
+}
+\end{lstlisting}
+
+\subsection{Carga del dataset de cuentas}
+
+Las cuentas se cargan desde el CSV con \codigo{Dataset.loadInto()} en
+\codigo{core/Dataset.java}. El archivo de referencia es
+\codigo{material-profesor/alumnos.csv}, entregado por el profesor y consumido tal
+cual (no se regenera ni se edita). Es CSV plano de cuatro columnas y \emph{sin}
+fila de encabezado, con el formato
+\codigo{nombre,apellido1,apellido2,saldo}; por eso la primera linea tambien se
+parsea, no se salta. Como no hay columna de id, el id de cada cuenta es su
+posicion en el archivo contando desde \codigo{idBase} (normalmente 1, via
+\codigo{TES\_ID\_BASE}): la primera linea de datos pasa a ser la cuenta
+\codigo{idBase}, la segunda \codigo{idBase+1}, y asi sucesivamente. Que todos los
+nodos lean el mismo archivo es justo lo que hace significativa la verificacion de
+conservacion del dinero en el cluster.
+
+El nombre del titular es la union con espacios de los tres campos de nombre. El
+saldo se convierte de su texto decimal a centavos enteros con
+\codigo{Money.toCents(String)}, de modo que ningun punto flotante toque jamas un
+saldo: los importes se manejan internamente en centavos. Las lineas vacias o con
+menos de cuatro columnas se descartan, y el metodo devuelve el numero de cuentas
+efectivamente cargadas (el valor que \codigo{Node.main()} exige que sea mayor que
+cero).
+
+\begin{lstlisting}[language=Java,caption={Asignacion de id por indice de fila y saldo en centavos (Dataset.loadInto)}]
+int id = idBase;
+int loaded = 0;
+// ...
+String[] cols = line.split(",", -1);
+if (cols.length < 4) {
+    continue;
+}
+String owner = cols[0].trim() + " " + cols[1].trim() + " " + cols[2].trim();
+long cents = Money.toCents(cols[3].trim());
+ledger.add(new Account(id, owner, cents));
+id++;
+loaded++;
+\end{lstlisting}

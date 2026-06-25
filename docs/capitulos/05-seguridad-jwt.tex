@@ -1,0 +1,194 @@
+\section{Seguridad: JWT y credenciales}
+
+La autenticación del API se apoya en tres piezas que viven en el paquete
+\codigo{security/}: un emisor/verificador de JWT (\codigo{security/Tokens.java}),
+un hashing de contraseñas (\codigo{security/Passwords.java}) con su almacén de
+credenciales (\codigo{security/Credential.java} y
+\codigo{security/CredentialStore.java}), y un orquestador
+(\codigo{security/Authenticator.java}) que une todo y protege los endpoints. El
+JWT es real (firmado con HMAC y verificado en cada petición protegida), no
+decorativo: el login valida la credencial y el registro guarda el hash, nunca la
+contraseña en claro.
+
+\subsection{Emision y verificacion de JWT}
+
+\codigo{security/Tokens.java} es un servicio de instancia que envuelve la
+librería \codigo{com.auth0.jwt} (java-jwt). Se construye con el secreto HMAC
+compartido y, a partir de él, crea un \codigo{Algorithm.HMAC256(secret)} y un
+\codigo{JWTVerifier} ya fijado al emisor \codigo{tesoreria}. Construir el
+verificador una sola vez en el constructor evita recompilar las reglas de
+verificación en cada petición.
+
+\begin{lstlisting}[language=Java,caption={Tokens: constructor, emision y validacion}]
+public Tokens(String secret) {
+    this.algorithm = Algorithm.HMAC256(secret);
+    this.verifier = JWT.require(algorithm).withIssuer(ISSUER).build();
+}
+
+public String issue(String subject) {
+    return JWT.create()
+            .withIssuer(ISSUER)
+            .withSubject(subject)
+            .sign(algorithm);
+}
+
+public String validate(String token) {
+    DecodedJWT decoded = verifier.verify(token);
+    return decoded.getSubject();
+}
+\end{lstlisting}
+
+\textbf{Qué claims lleva.} El método \codigo{issue(subject)} firma un token
+compacto con dos claims: el emisor (\codigo{iss = tesoreria}) y el sujeto
+(\codigo{sub}), que es el nombre de usuario autenticado. El token no incluye un
+claim de expiración (\codigo{exp}): no se llama a \codigo{withExpiresAt}, de modo
+que el token es válido mientras lo sea la firma. La firma es HMAC-SHA256 sobre el
+secreto compartido, lo que garantiza integridad y autenticidad pero no
+confidencialidad (el payload va en Base64, no cifrado), por lo que no debe
+guardarse información sensible en los claims.
+
+\textbf{Cómo se verifica.} En cada petición protegida, \codigo{validate(token)}
+llama a \codigo{verifier.verify(token)}, que comprueba la firma HMAC256 y que el
+emisor sea \codigo{tesoreria}; si algo no cuadra, java-jwt lanza una
+\codigo{JWTVerificationException} (subtipo de \codigo{RuntimeException}). Si la
+verificación pasa, devuelve el sujeto, es decir, la identidad que viajaba en el
+token.
+
+\textbf{Secreto compartido entre nodos.} El secreto se inyecta desde fuera: en
+\codigo{app/Node.java} se construye \codigo{new Tokens(config.jwtSecret())}, y ese
+valor proviene de la variable de entorno \codigo{TES\_JWT\_SECRET} leída por
+\codigo{app/NodeConfig.java}. Como documenta ese archivo, \codigo{TES\_JWT\_SECRET}
+debe tener \emph{el mismo valor en los tres nodos}, de forma que un token emitido
+en cualquier nodo (por ejemplo, tras hacer login en el líder) valide en todos. Es
+la propiedad clave de un secreto HMAC simétrico: quien conoce el secreto puede
+tanto firmar como verificar.
+
+\subsection{Contrasenas y credenciales}
+
+Las contraseñas nunca se almacenan en texto plano. \codigo{security/Passwords.java}
+es un ayudante sin estado, con dos métodos estáticos respaldados por jBCrypt
+(\codigo{org.mindrot.jbcrypt.BCrypt}), que esconde la generación de la sal y la
+comparación tras una API mínima.
+
+\begin{lstlisting}[language=Java,caption={Passwords: hash y verificacion con BCrypt}]
+public static String encode(String raw) {
+    return BCrypt.hashpw(raw, BCrypt.gensalt());
+}
+
+public static boolean matches(String raw, String hash) {
+    return BCrypt.checkpw(raw, hash);
+}
+\end{lstlisting}
+
+\codigo{encode(raw)} genera una sal nueva con \codigo{BCrypt.gensalt()} y produce
+el hash BCrypt, que ya lleva la sal incrustada en su cadena. Se usa BCrypt en
+lugar de un hash simple porque es deliberadamente lento (factor de coste) y salado
+por diseño, lo que dificulta los ataques de fuerza bruta y de tablas
+precalculadas. \codigo{matches(raw, hash)} re-deriva el hash del candidato con la
+misma sal del hash guardado y compara; \codigo{BCrypt.checkpw} encapsula esa
+comparación. Como cada llamada a \codigo{encode} usa una sal distinta, dos
+usuarios con la misma contraseña obtienen hashes diferentes.
+
+Una credencial almacenada se modela con \codigo{security/Credential.java}, un
+\codigo{record} inmutable que empareja el \codigo{username} con su
+\codigo{passwordHash} BCrypt y, por contrato, nunca contiene la contraseña en
+claro:
+
+\begin{lstlisting}[language=Java,caption={Credential: record inmutable}]
+public record Credential(String username, String passwordHash) {
+}
+\end{lstlisting}
+
+El registro de credenciales vive en \codigo{security/CredentialStore.java}, un
+almacén en memoria seguro para hilos basado en un
+\codigo{ConcurrentHashMap<String, Credential>} indexado por nombre de usuario. La
+operación de alta es atómica: \codigo{register(username, passwordHash)} usa
+\codigo{putIfAbsent}, de modo que un nombre de usuario sólo puede reclamarse una
+vez aunque dos peticiones de registro lleguen en paralelo.
+
+\begin{lstlisting}[language=Java,caption={CredentialStore: alta atomica y busqueda}]
+public boolean register(String username, String passwordHash) {
+    Credential created = new Credential(username, passwordHash);
+    return byUsername.putIfAbsent(username, created) == null;
+}
+
+public Credential find(String username) {
+    return byUsername.get(username);
+}
+\end{lstlisting}
+
+\codigo{register} devuelve \codigo{true} si el alta tuvo éxito y \codigo{false} si
+el usuario ya existía (cuando \codigo{putIfAbsent} no es \codigo{null}); y
+\codigo{find(username)} devuelve la credencial guardada o \codigo{null} si no hay
+ninguna. Al ser un almacén en memoria, las credenciales son locales al proceso y
+no se replican entre nodos junto con el libro mayor.
+
+\subsection{Autenticador y proteccion de endpoints}
+
+\codigo{security/Authenticator.java} es la fachada que coordina alta de cuentas,
+login y autorización de peticiones. Se construye inyectándole un
+\codigo{CredentialStore} (quién existe) y un \codigo{Tokens} (prueba de identidad);
+en \codigo{app/Node.java} se crea con \codigo{new Authenticator(credentials,
+tokens)}.
+
+\textbf{Alta y login.} \codigo{signup(username, password)} hashea la contraseña
+con \codigo{Passwords.encode} y delega en \codigo{store.register}, devolviendo
+\codigo{false} si el usuario estaba tomado. \codigo{login(username, password)}
+busca la credencial, verifica la contraseña con \codigo{Passwords.matches} y, sólo
+si todo concuerda, emite un JWT con \codigo{tokens.issue(username)}; en cualquier
+fallo (usuario inexistente o contraseña incorrecta) devuelve \codigo{null}, sin
+distinguir el caso para no filtrar qué usuarios existen.
+
+\textbf{Autorización por Bearer.} \codigo{authorize(req)} extrae la cabecera
+\codigo{Authorization}, exige el esquema \codigo{Bearer} y valida el token:
+
+\begin{lstlisting}[language=Java,caption={Authenticator.authorize: validacion del Bearer}]
+public String authorize(Request req) {
+    String header = req.header("Authorization");
+    if (header == null) {
+        return null;
+    }
+    String[] parts = WHITESPACE.split(header.trim(), 2);
+    if (parts.length < 2 || !SCHEME.equalsIgnoreCase(parts[0])) {
+        return null;
+    }
+    String token = parts[1].trim();
+    if (token.isEmpty()) {
+        return null;
+    }
+    try {
+        return tokens.validate(token);
+    } catch (RuntimeException e) {
+        return null;
+    }
+}
+\end{lstlisting}
+
+El método es tolerante con el formato según el RFC 7235: el esquema se compara con
+\codigo{equalsIgnoreCase} (acepta \codigo{Bearer}, \codigo{bearer} o
+\codigo{BEARER}) y los espacios sobrantes se absorben partiendo con un patrón de
+espacios precompilado (\codigo{WHITESPACE}). Devuelve el sujeto del token cuando
+la firma y el emisor son válidos, y \codigo{null} en todos los casos de fallo:
+cabecera ausente, esquema equivocado, token vacío o cualquier
+\codigo{JWTVerificationException} capturada como \codigo{RuntimeException}.
+
+\textbf{Rutas públicas frente a protegidas.} El registro de rutas se hace en
+\codigo{app/Node.java}. Son \emph{públicas} \codigo{POST /api/register} (atendida
+por \codigo{RegisterEndpoint}) y \codigo{POST /api/login} (atendida por
+\codigo{LoginEndpoint}): no requieren token porque su propósito es precisamente
+obtenerlo. Son \emph{protegidas} las que operan sobre cuentas, como
+\codigo{GET /api/accounts/\{id\}} (\codigo{BalanceEndpoint}) y
+\codigo{POST /api/transactions/transfer} (\codigo{TransferEndpoint}). Cada una
+empieza llamando a \codigo{auth.authorize(req)} y, si devuelve \codigo{null},
+corta con \codigo{Reply.status(401)} antes de tocar la lógica de negocio:
+
+\begin{lstlisting}[language=Java,caption={BalanceEndpoint: corte 401 si el token falla}]
+if (auth.authorize(req) == null) {
+    return Reply.status(401);
+}
+\end{lstlisting}
+
+Así, una petición sin cabecera \codigo{Authorization}, con un esquema distinto de
+Bearer o con un token mal firmado o de otro emisor recibe un \codigo{401
+Unauthorized}, mientras que un token válido deja pasar la petición a la operación
+correspondiente.

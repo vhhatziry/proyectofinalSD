@@ -1,0 +1,7 @@
+# LaTeX build artifacts (compilar.sh regenerates manual-estudio.pdf; these are transient).
+# The PDF itself IS tracked on purpose so the manual can be read without compiling.
+*.aux
+*.log
+*.out
+*.toc
+*.synctex.gz

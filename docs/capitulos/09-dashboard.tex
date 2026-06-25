@@ -1,0 +1,129 @@
+\section{Dashboard de observabilidad}
+
+El dashboard es la cara visible del cluster: una sola página web que monitorea
+los tres nodos a la vez y, para cada uno, pinta los datos de negocio (cuentas,
+saldo, transferencias, secuencia de la última transacción) junto con las
+métricas de infraestructura del sistema operativo de su máquina (CPU, RAM y
+Disco). El armado descansa en tres endpoints HTTP, registrados en
+\codigo{app/Node.java} sobre el router \codigo{net/Routes.java}: \codigo{GET /}
+sirve la página, \codigo{GET /panel} agrega la vista de todo el cluster y
+\codigo{GET /api/stats} expone las métricas de un solo nodo. El extra de la
+rúbrica (auto-refresh, sin tener que pulsar ``Refrescar'') se cubre con un
+\codigo{setInterval} de polling en el JavaScript de la página.
+
+\subsection{La interfaz web}
+
+La página vive como recurso estático en \codigo{src/main/resources/dashboard.html}
+y se entrega tal cual desde el classpath por \codigo{api/DashboardEndpoint.java}:
+ese endpoint solo valida que el método sea \codigo{GET} (responde \codigo{405} si
+no) y vuelca el HTML con \codigo{Reply.html(200, ...)}, leyendo el recurso
+\codigo{/dashboard.html} en cada petición. No tiene colaboradores ni lógica de
+negocio; toda la inteligencia está en el JavaScript del propio documento.
+
+Es una SPA en HTML/CSS/JS puro, sin dependencias ni librerías externas. Al
+cargar, y cada vez que se refresca, la función \codigo{loadPanel()} hace
+\codigo{fetch("/panel")} pidiendo JSON y, con la respuesta, repinta tres zonas:
+el \emph{hero} (saldo total del cluster, número de cuentas y última transacción,
+tomados del nodo líder), un sello de consistencia que compara los saldos totales
+de los nodos en línea para indicar si el invariante se conserva, y una tarjeta
+por nodo. Cada tarjeta dibuja el rol (\codigo{Lider}/\codigo{Replica}), el estado
+(\codigo{Activo}/\codigo{Caido}), el saldo del nodo, los cuatro contadores de
+negocio (cuentas, transferencias, última tx y transacciones en Cloud Storage) y
+tres barras (\emph{gauges}) para CPU, RAM y Disco. Si \codigo{/panel} falla, se
+muestra un \emph{banner} de error en vez de romper la página.
+
+El auto-refresh, que da los 15 puntos extra, es un \emph{toggle} ``En vivo'' que
+\textbf{arranca encendido por defecto}: el checkbox lleva \codigo{checked} y, al
+cargar, la página llama \codigo{toggleReactive(checkbox.checked)}, de modo que el
+tablero empieza a refrescarse solo \emph{sin pulsar ``Refrescar''}, que es justo lo
+que pide el extra. \codigo{toggleReactive()} arranca un \codigo{setInterval} que
+vuelve a llamar a \codigo{loadPanel()} cada \codigo{REACTIVE\_INTERVAL\_MS}
+(1500 ms); al desactivar el toggle se limpia el temporizador con
+\codigo{clearInterval}.
+
+\begin{lstlisting}[language=none,caption={Polling automatico del dashboard (dashboard.html)}]
+// Poll cadence (ms) used when the reactive toggle is enabled.
+const REACTIVE_INTERVAL_MS = 1500;
+let timer = null;
+// ...
+function toggleReactive(enabled) {
+  if (timer) { clearInterval(timer); timer = null; }
+  if (enabled) timer = setInterval(loadPanel, REACTIVE_INTERVAL_MS);
+  loadPanel();
+}
+\end{lstlisting}
+
+\subsection{Datos de negocio}
+
+Los datos de negocio de cada nodo nacen en \codigo{app/NodeStats.java}, un
+\emph{snapshot} en vivo que reparte las cifras entre dos colaboradores: del
+\codigo{core/Ledger.java} salen el número de cuentas (\codigo{accountCount()} vía
+\codigo{ledger.size()}) y el saldo total en centavos (\codigo{totalCents()}); del
+\codigo{core/Bank.java} salen el número de transferencias confirmadas
+(\codigo{transferCount()} vía \codigo{bank.appliedCount()}) y la secuencia de la
+última transacción aplicada (\codigo{lastTxId()} vía \codigo{bank.lastSeq()}). El
+método \codigo{toJson()} serializa todo a un \codigo{JsonObject} cuyas claves
+coinciden exactamente con los campos que consume el JavaScript: \codigo{nodeId},
+\codigo{role}, \codigo{status}, \codigo{accountCount}, \codigo{totalBalance}
+(convertido a decimal con \codigo{Money.toDecimal()}), \codigo{transferCount},
+\codigo{lastTxId}, los tres porcentajes y \codigo{gcsCount}.
+
+Quien expone ese JSON de un solo nodo es \codigo{api/StatsEndpoint.java} en la
+ruta \codigo{GET /api/stats}: valida el método y devuelve
+\codigo{Reply.json(200, stats.toJson())}. Sobre él se monta
+\codigo{api/PanelEndpoint.java} (ruta \codigo{GET /panel}), que arma la vista del
+cluster completo: parte del \codigo{toJson()} del nodo local y, en paralelo,
+consulta el \codigo{/api/stats} de cada peer listado en \codigo{TES\_PEERS}
+(\codigo{NodeConfig}). Las peticiones se lanzan concurrentes con
+\codigo{CompletableFuture} para que un nodo caído sume a lo sumo un \emph{timeout}
+a la latencia del panel, no uno por peer; un peer inalcanzable no rompe la
+respuesta, sino que se reporta como nodo en estado \codigo{down}. El resultado es
+un único documento \codigo{\{"nodes":[...]\}} con una entrada por nodo.
+
+\begin{lstlisting}[language=Java,caption={PanelEndpoint agrega el nodo local y los peers}]
+StringBuilder nodes = new StringBuilder();
+nodes.append("{\"nodes\":[").append(stats.toJson());
+for (CompletableFuture<String> peer : pending) {
+    nodes.append(',').append(peer.join());
+}
+nodes.append("]}");
+return Reply.json(200, nodes.toString());
+\end{lstlisting}
+
+\subsection{Métricas de infraestructura del SO}
+
+Las tres barras de CPU, RAM y Disco no son inventadas: \codigo{NodeStats} las lee
+del sistema operativo de cada VM con Java puro, sin librerías externas. El CPU se
+toma de \codigo{/proc/stat}: \codigo{cpuPercent()} suma los \emph{jiffies} de la
+línea agregada \codigo{cpu} y calcula la fracción ocupada como
+$1 - \Delta\text{idle}/\Delta\text{total}$ entre dos lecturas consecutivas (entre
+dos refrescos del dashboard), guardando el muestreo previo bajo
+\codigo{cpuLock} para que las peticiones concurrentes no se pisen. La RAM viene
+de \codigo{/proc/meminfo} (\codigo{ramPercent()} compara \codigo{MemTotal} contra
+\codigo{MemAvailable}). El Disco se calcula con \codigo{java.io.File} sobre la
+raíz \codigo{/}: \codigo{diskPercent()} usa \codigo{getTotalSpace()} y
+\codigo{getUsableSpace()}. Las tres pasan por \codigo{clamp()} al rango
+$[0, 100]$ y por \codigo{round1()} a un decimal antes de serializarse.
+
+\begin{lstlisting}[language=Java,caption={Lectura de \%RAM y \%Disco del SO (NodeStats)}]
+public double ramPercent() {
+    try {
+        long total = readMeminfo("MemTotal");
+        long available = readMeminfo("MemAvailable");
+        if (total <= 0L) {
+            return 0.0;
+        }
+        return clamp((double) (total - available) / total * 100.0);
+    } catch (RuntimeException | IOException e) {
+        return 0.0;
+    }
+}
+\end{lstlisting}
+
+Estos porcentajes viajan al tablero por la misma vía que los datos de negocio:
+\codigo{toJson()} los empaqueta como \codigo{cpuPercent}, \codigo{ramPercent} y
+\codigo{diskPercent}; \codigo{StatsEndpoint} los publica en \codigo{/api/stats},
+\codigo{PanelEndpoint} los agrega en \codigo{/panel}, y el JavaScript de
+\codigo{dashboard.html} los dibuja como \emph{gauges} (la barra se pinta en tono
+de alarma cuando el valor llega al 80\%). Así, cada métrica del cuadro proviene
+directamente del SO de la máquina que la reporta.

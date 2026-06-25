@@ -1,0 +1,186 @@
+\section{Servidor HTTP en NIO puro}
+
+El transporte HTTP de la tesoreria no se apoya en \codigo{com.sun.net.httpserver}
+ni en ningun framework: es una pila propia escrita sobre \codigo{java.nio}, repartida
+en ocho clases del paquete \codigo{net}. \codigo{net/Server.java} es la puerta de
+entrada, \codigo{net/IoLoop.java} es el reactor que hace toda la E/S,
+\codigo{net/Channel.java} guarda el estado de cada conexion, \codigo{net/RequestParser.java}
+parsea HTTP de forma incremental, \codigo{net/Request.java} y \codigo{net/Reply.java}
+modelan peticion y respuesta, y \codigo{net/Routes.java} con \codigo{net/Endpoint.java}
+resuelven el ruteo. Este capitulo explica por que se construyo asi y como encajan las
+piezas.
+
+\subsection{Por que un servidor propio}
+
+La razon principal es doble. Primero, la regla de "Java puro" del concurso prohibe
+servidores de libreria; escribir el transporte sobre \codigo{java.nio} mantiene la
+dependencia unicamente en el JDK. Segundo, y mas importante, el concurso evalua bajo
+carga, y un servidor propio da control fino sobre la concurrencia: se decide cuantos
+reactores corren, cuantos hilos de trabajo computan respuestas y como se reparte la
+E/S entre nucleos.
+
+Un servidor de libreria basado en un \codigo{ThreadPool} bloqueante (un hilo por
+conexion) gasta un hilo del sistema operativo por cada socket abierto, lo que no
+escala cuando hay miles de conexiones en keep-alive mayormente ociosas. El diseno NIO
+multiplexa muchas conexiones sobre pocos hilos mediante un \codigo{Selector}: un solo
+hilo reactor vigila cientos de sockets y solo despierta para los que tienen datos
+listos. Asi se separa la E/S (barata, dirigida por eventos) del computo de la respuesta
+(que puede tocar el banco y la replicacion), y cada parte se dimensiona por separado.
+
+\subsection{Modelo de concurrencia: IoLoop y workers}
+
+El diseno sigue el patron Reactor con pool de trabajadores (Doug Lea, patron 3) y usa
+tres clases de hilo con responsabilidades disjuntas, lo que evita casi todo bloqueo
+compartido.
+
+El \codigo{Server} posee un \codigo{ServerSocketChannel}, un hilo aceptador dedicado,
+un arreglo de reactores \codigo{IoLoop} (cada uno con su propio \codigo{Selector}) y un
+pool compartido de hilos worker. El numero de reactores y de workers se fija en el
+constructor; en produccion los provee \codigo{app/NodeConfig.java} desde las variables
+de entorno \codigo{TES\_REACTORS} (por defecto uno por CPU) y \codigo{TES\_WORKERS}
+(por defecto 16). Con \codigo{reactors == 1} se obtiene el reactor unico clasico, un
+respaldo seguro.
+
+El \textbf{hilo aceptador} corre \codigo{acceptLoop()}: se bloquea en \codigo{accept()}
+y reparte cada conexion nueva entre los reactores en round-robin. Repartir aqui evita
+que un solo reactor sature un nucleo mientras los demas estan ociosos, que es el cuello
+de botella del reactor unico.
+
+\begin{lstlisting}[language=Java,caption={El aceptador reparte cada conexion en round-robin (net/Server.java)}]
+SocketChannel socket = serverChannel.accept();
+if (socket == null) {
+    continue;
+}
+socket.configureBlocking(false);
+loops[next].register(socket);
+next = (next + 1) % loops.length;
+\end{lstlisting}
+
+Cada \textbf{hilo reactor} (\codigo{IoLoop}) hace solo lectura y escritura para sus
+conexiones; nunca calcula una \codigo{Reply} en linea. Su \codigo{run()} se bloquea en
+\codigo{selector.select()} y, al despertar, primero drena dos colas:
+\codigo{registerPending()} registra los sockets que el aceptador dejo en cola, y
+\codigo{enableQueuedWrites()} activa \codigo{OP\_WRITE} para las llaves cuya respuesta
+ya esta lista. Esto es deliberado: el registro de canales y las mutaciones del conjunto
+de intereses (\codigo{interestOps}) ocurren unicamente en el hilo del reactor, de modo
+que el aceptador y los workers se comunican mediante colas concurrentes
+(\codigo{ConcurrentLinkedQueue}) y \codigo{selector.wakeup()}, manteniendo fuera del
+diseno la clasica condicion de carrera entre hilos sobre el \codigo{Selector}.
+
+Cuando \codigo{onRead()} lee bytes y el parser reporta una peticion completa, el reactor
+no la atiende: pausa las lecturas de esa conexion con \codigo{key.interestOps(0)} y
+envia el trabajo al pool con \codigo{workers.submit(...)}. Pausar las lecturas garantiza
+una sola peticion en vuelo por conexion, lo que ordena las respuestas sin necesidad de
+pipelining.
+
+\begin{lstlisting}[language=Java,caption={El reactor delega el computo al worker (net/IoLoop.java)}]
+boolean complete = channel.parser().feed(buffer);
+buffer.compact();
+if (complete) {
+    Request request = channel.parser().take();
+    channel.setProcessing(true);
+    // Pause reads until this reply is flushed: one request in flight per
+    // connection, which keeps responses ordered without pipelining.
+    key.interestOps(0);
+    workers.submit(() -> handle(key, channel, request));
+}
+\end{lstlisting}
+
+El \textbf{hilo worker} ejecuta \codigo{handle()}: rutea con \codigo{routes.match(...)},
+invoca al \codigo{Endpoint}, serializa la \codigo{Reply} a un \codigo{ByteBuffer} HTTP/1.1
+y la encola en el \codigo{Channel}. Luego devuelve la llave al reactor anadiendola a
+\codigo{writeReady} y llamando \codigo{selector.wakeup()}; el reactor activara
+\codigo{OP\_WRITE} y \codigo{onWrite()} hara el flush real. El estado por conexion vive
+en \codigo{Channel}, cuyo punto de encuentro es la cola \codigo{outbound}: el worker la
+llena con \codigo{enqueue()} (sincronizado) y el reactor la vacia con
+\codigo{peekOutbound()}/\codigo{popOutbound()} en cada evento de escritura. Si el buffer
+de envio del socket se llena, \codigo{onWrite()} deja la escritura a medias y conserva
+el interes en \codigo{OP\_WRITE} para reintentar despues.
+
+\subsection{Parseo de peticiones y rutas}
+
+Cada \codigo{Channel} tiene su propio \codigo{RequestParser}, un parser HTTP/1.1
+incremental con maquina de estados explicita (\codigo{READ\_LINE}, \codigo{READ\_HEADERS},
+\codigo{READ\_BODY}, \codigo{DONE}). Su metodo \codigo{feed(ByteBuffer)} consume los
+bytes conforme llegan, sin re-escanear el buffer desde cero, y devuelve \codigo{true}
+cuando hay una peticion completa disponible via \codigo{take()}. En \codigo{READ\_LINE}
+y \codigo{READ\_HEADERS} acumula una linea terminada en CRLF; al llegar el \verb|\n|,
+\codigo{parseRequestLine()} divide "METHOD destino HTTP/x.y" (separando el destino en
+\codigo{path} y \codigo{query} por el primer \codigo{?}) y \codigo{parseHeader()} guarda
+cada cabecera con su nombre en minusculas. La linea vacia cierra las cabeceras: si hay
+\codigo{Content-Length} se pasa a \codigo{READ\_BODY} y se leen exactamente esos bytes;
+si no, la peticion ya esta completa. \codigo{take()} entrega un \codigo{Request} inmutable
+y resetea la maquina para la siguiente peticion sobre la misma conexion keep-alive. El
+parser tambien decide el keep-alive (\codigo{computeKeepAlive()}): respeta la cabecera
+\codigo{Connection} y, en su ausencia, mantiene viva la conexion solo en HTTP/1.1.
+
+El \codigo{Request} resultante es una vista inmutable: expone \codigo{method()},
+\codigo{path()}, \codigo{query()}, \codigo{header(name)} (insensible a mayusculas),
+\codigo{body()}/\codigo{bodyText()} y \codigo{pathParam(name)}. La firma del handler la
+define \codigo{net/Endpoint.java}, una interfaz funcional con un solo metodo:
+
+\begin{lstlisting}[language=Java,caption={Contrato de un manejador de peticiones (net/Endpoint.java)}]
+@FunctionalInterface
+public interface Endpoint {
+
+    /** Handles one request and produces its reply. */
+    Reply serve(Request req);
+}
+\end{lstlisting}
+
+El ruteo lo hace \codigo{Routes}, un router por metodo y path. Cada patron se parte en
+segmentos por \codigo{/}; un segmento escrito como \codigo{\{name\}} es una variable de
+un solo segmento y los demas deben coincidir por igualdad exacta de cadena (es coincidencia
+exacta de segmentos, no de prefijo mas largo). \codigo{register(method, pattern, endpoint)}
+compila el patron y \codigo{match(method, path)} lo resuelve, capturando las variables.
+Las semanticas de resolucion son precisas: si coinciden el metodo y la forma de segmentos
+devuelve un \codigo{Match} con estado 200 y el \codigo{Endpoint}; si algun patron coincide
+con el path pero ningun metodo encaja devuelve 405; y si ningun patron coincide, 404.
+
+\begin{lstlisting}[language=Java,caption={Coincidencia de segmentos y captura de variables (net/Routes.java)}]
+for (int i = 0; i < segments.length; i++) {
+    String pat = route.segments[i];
+    if (isVariable(pat)) {
+        params.put(pat.substring(1, pat.length() - 1), segments[i]);
+    } else if (!pat.equals(segments[i])) {
+        shapeMatches = false;
+        break;
+    }
+}
+\end{lstlisting}
+
+En \codigo{IoLoop.handle()}, cuando \codigo{match.status} es 200 se llama
+\codigo{request.bindPathParams(match.params)} para inyectar las variables capturadas y
+luego \codigo{match.endpoint.serve(request)}. Un estado distinto de 200 se traduce a
+\codigo{Reply.status(match.status)} (404 o 405); si el endpoint devuelve \codigo{null} o
+lanza una \codigo{RuntimeException}, el reactor responde 500.
+
+\subsection{Construccion de respuestas}
+
+La respuesta se modela con \codigo{net/Reply.java}, un objeto que el worker construye y
+el reactor serializa despues. Lleva el codigo de estado, el \codigo{Content-Type} y el
+cuerpo en bytes. Sus factorias estaticas cubren los tipos que emite el servicio:
+\codigo{Reply.json(status, json)} fija \codigo{application/json; charset=utf-8} y
+codifica el cuerpo en UTF-8; \codigo{Reply.text(...)} produce \codigo{text/plain};
+\codigo{Reply.html(...)} sirve \codigo{text/html} a partir de bytes crudos (por ejemplo
+una pagina leida de recursos); y \codigo{Reply.status(int)} arma una respuesta solo de
+estado con cuerpo vacio, la que usa el reactor para 404, 405 y 500.
+
+\begin{lstlisting}[language=Java,caption={Factoria JSON de respuestas (net/Reply.java)}]
+public static Reply json(int status, String json) {
+    return new Reply(status, "application/json; charset=utf-8",
+            json.getBytes(StandardCharsets.UTF_8));
+}
+\end{lstlisting}
+
+\codigo{Reply} ofrece ademas \codigo{close()}, que marca la conexion para cerrarse tras
+enviar la respuesta (encadenable porque devuelve \codigo{this}). La escritura efectiva
+del HTTP no ocurre en \codigo{Reply}: el reactor la serializa en \codigo{IoLoop.serialize()},
+que arma la linea de estado \codigo{HTTP/1.1 <codigo> <razon>} con las cabeceras
+\codigo{Content-Type}, \codigo{Content-Length} y \codigo{Connection} (\codigo{keep-alive}
+o \codigo{close}, segun lo decidido entre \codigo{request.wantsClose()} y
+\codigo{reply.isClose()}), seguidas del cuerpo. La razon textual la traduce
+\codigo{reason(int)} para los codigos que el servicio emite (200, 201, 400, 401, 403,
+404, 405, 409, 500). De este modo \codigo{Reply} permanece como un valor inmutable y
+agnostico al cable, y toda la mecanica de bytes y keep-alive queda concentrada en el
+reactor.

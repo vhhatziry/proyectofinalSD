@@ -1,0 +1,214 @@
+\section{Replicacion y reanudacion exacta por secuencia}
+
+Este capitulo es el punto clave de la rubrica de tolerancia a fallos: cuando se
+mata el \emph{proceso} de una replica (no la maquina virtual) y luego revive, la
+replica debe reanudar \textbf{desde el numero de secuencia exacto} en el que se
+quedo, pidiendo al lider solo el delta faltante. El anti-patron de ``borrar el
+estado y volver a descargar todo'' funciona pero no escala y cuesta puntos. Las
+piezas que lo implementan son \codigo{cluster/ReplicaFeed.java} (lado lider),
+\codigo{cluster/ReplicaSync.java} (lado replica), \codigo{cluster/WireCodec.java}
+(formato de mensaje) y \codigo{durable/ReplicaCheckpoint.java} (durabilidad que
+sobrevive a la muerte del proceso).
+
+\subsection{Protocolo de replicacion}
+
+El lider publica su flujo de \emph{commits} sobre TCP plano a traves de
+\codigo{cluster/ReplicaFeed.java}, que escucha en el puerto de replicacion
+\codigo{TES\_REPL\_PORT}. Cuando una replica se conecta, primero anuncia hasta
+donde ya esta al dia con un saludo de una linea \codigo{CATCHUP <seq>}; el lider
+lo lee en \codigo{serveReplica()} y \codigo{parseCatchup()}. La respuesta consta
+de dos fases: primero reproduce, en orden, todas las transferencias del
+\codigo{core/TransferLog.java} cuya secuencia es estrictamente mayor que esa marca
+(\codigo{log.since(since)}), y despues sigue transmitiendo en vivo cada nuevo
+commit.
+
+El detalle decisivo es que \textbf{el lider no espera confirmacion de las
+replicas}: nunca bloquea su throughput por una replica lenta o caida.
+\codigo{ReplicaFeed} es un \codigo{core/CommitListener.java} invocado en linea
+sobre los hilos de commit del lider, asi que no puede bloquearse ahi. Cada
+suscriptor tiene su propia cola acotada (\codigo{QUEUE\_CAPACITY = 8192}) y un
+hilo escritor dedicado; \codigo{onCommit()} solo hace un \codigo{offer} no
+bloqueante en cada cola. Una replica cuyo socket se atasca solo llena su
+\emph{propia} cola; al desbordarse, se descarta ese suscriptor y se cierra su
+socket, sin afectar la ruta de commit ni a las demas replicas.
+
+\begin{lstlisting}[language=Java,caption={ReplicaFeed.onCommit: fan-out no bloqueante hacia las replicas}]
+@Override
+public void onCommit(Transfer t) {
+    String line = WireCodec.encode(t);
+    for (Subscriber subscriber : subscribers) {
+        if (!subscriber.enqueue(line)) {
+            drop(subscriber);
+        }
+    }
+}
+\end{lstlisting}
+
+El formato de cada mensaje lo define \codigo{cluster/WireCodec.java}: una
+transferencia se serializa como un unico objeto JSON por linea con los cuatro
+campos que un par necesita para reaplicar el commit (la secuencia, las cuentas
+origen y destino, y el monto en centavos). Al ser texto y un objeto por linea, la
+replica puede leer el flujo con un lector de lineas ordinario. \codigo{WireCodec}
+es un ayudante sin estado (constructor privado) que solo expone
+\codigo{encode()} y \codigo{decode()}; los campos numericos se leen con su ancho
+nativo (\codigo{getAsLong}/\codigo{getAsInt}) para que \codigo{seq} y
+\codigo{cents} de 64 bits sobrevivan el viaje de ida y vuelta sin perder
+precision.
+
+\begin{lstlisting}[language=Java,caption={WireCodec: codificar y decodificar una transferencia como linea JSON}]
+public static String encode(Transfer t) {
+    JsonObject object = new JsonObject();
+    object.addProperty("seq", t.seq());
+    object.addProperty("from", t.from());
+    object.addProperty("to", t.to());
+    object.addProperty("cents", t.cents());
+    return object.toString();
+}
+
+public static Transfer decode(String line) {
+    try {
+        JsonObject object = JsonParser.parseString(line).getAsJsonObject();
+        long seq = object.get("seq").getAsLong();
+        int from = object.get("from").getAsInt();
+        int to = object.get("to").getAsInt();
+        long cents = object.get("cents").getAsLong();
+        return new Transfer(seq, from, to, cents);
+    } catch (RuntimeException ex) {
+        throw new IllegalArgumentException("malformed transfer line: " + line, ex);
+    }
+}
+\end{lstlisting}
+
+La linea de cable es entonces \codigo{\{"seq":..,"from":..,"to":..,"cents":..\}}
+seguida de un salto de linea. El orden se mantiene sin un candado global de
+difusion: el lider agrega la transferencia al log \emph{antes} de notificar a los
+oyentes, y un suscriptor se registra en la audiencia en vivo \emph{antes} de que
+su escritor lea el backlog, de modo que todo commit llega a la replica por el
+backlog, por la cola en vivo, o (inofensivamente) por ambos. Los duplicados y el
+ligero reordenamiento en esa frontera los absorbe la replica.
+
+\subsection{La replica: aplicar y seguir el flujo}
+
+Del lado seguidor, \codigo{cluster/ReplicaSync.java} mantiene al nodo alineado con
+el lider. Marca al puerto de replicacion del \codigo{TES\_LEADER\_HOST} y abre la
+conversacion con el saludo \codigo{CATCHUP <seq>}, donde la secuencia es
+\codigo{Bank.lastSeq()}, la transferencia mas alta que el \codigo{core/Bank.java}
+local ya aplico. El lider entonces transmite, como lineas JSON, primero el backlog
+posterior a esa marca y luego cada commit en vivo; cada linea recibida se vuelve a
+convertir en un \codigo{core/Transfer.java} con \codigo{WireCodec.decode()}.
+
+Como el lider reparte los commits desde hilos concurrentes, una secuencia mas alta
+puede llegar antes que una mas baja. Por eso \codigo{ReplicaSync} aplica las
+transferencias a traves de un pequeno \emph{buffer de reordenamiento}
+(\codigo{TreeMap<Long, Transfer> pending}) que garantiza que el banco siempre las
+vea en orden de secuencia estricto y sin huecos. \codigo{bufferAndDrain()}
+guarda las llegadas fuera de orden hasta que las secuencias faltantes se
+completan, y entonces las vacia de forma contigua hacia
+\codigo{Bank.applyReplicated()}. Una transferencia con secuencia igual o menor a
+la marca del banco es un duplicado y se descarta, asi que un solapamiento
+reenviado tras una reconexion es inofensivo.
+
+\begin{lstlisting}[language=Java,caption={ReplicaSync.bufferAndDrain: reordenar y aplicar en secuencia contigua}]
+private void bufferAndDrain(TreeMap<Long, Transfer> pending, Transfer t) {
+    if (t.seq() > bank.lastSeq()) {
+        pending.put(t.seq(), t);
+    }
+    while (!pending.isEmpty() && pending.firstKey() <= bank.lastSeq() + 1) {
+        Transfer next = pending.pollFirstEntry().getValue();
+        if (next.seq() > bank.lastSeq()) {
+            bank.applyReplicated(next);
+        }
+    }
+}
+\end{lstlisting}
+
+El enlace se trata como poco confiable. El lector corre dentro de
+\codigo{syncLoop()}, un bucle que, ante cualquier caida, espera brevemente
+(\codigo{RECONNECT\_DELAY\_MS = 1000}) y vuelve a marcar, reemitiendo
+\codigo{CATCHUP} con la marca mas reciente del banco para que la reproduccion se
+reanude desde ahi y no desde cero. Cada reconexion estrena un buffer
+\codigo{pending} nuevo, de modo que cualquier resto fuera de orden del enlace
+anterior se descarta. Una linea corrupta tampoco mata al lector: rompe el ciclo
+interno para que el bucle externo reconecte y el lider reenvie desde la marca
+actual.
+
+\subsection{Checkpoint local y reanudacion exacta}
+
+Todo lo anterior basta para sobrevivir a una caida de \emph{red}: la marca vive en
+memoria en \codigo{Bank.lastSeq()}. Pero si matan el \emph{proceso} de la replica,
+esa memoria se pierde. Aqui entra \codigo{durable/ReplicaCheckpoint.java}, que
+persiste en almacenamiento durable lo necesario para reanudar exacto: la marca de
+secuencia y los saldos. Un checkpoint es un unico objeto de Cloud Storage,
+sobrescrito en el mismo lugar, con la forma
+\codigo{\{v, watermark, idBase, count, balances\}}. El \codigo{watermark} es la
+secuencia mas alta aplicada; \codigo{balances} es una instantanea posicional donde
+el casillero \codigo{k} corresponde al saldo de la cuenta \codigo{idBase + k}, asi
+que la posicion codifica el id y no se guarda una clave por cuenta. La marca y los
+saldos se capturan juntos bajo el monitor del banco (\codigo{Bank.snapshotInto()}),
+de modo que el par es consistente aunque el hilo de sincronizacion este aplicando
+transferencias.
+
+Al revivir, \codigo{load()} se ejecuta \emph{antes} de que arranque la
+replicacion: restaura los saldos sobre el ledger ya cargado del CSV y siembra la
+marca del banco con \codigo{Bank.seedLastSeq(watermark)}, que sube (nunca baja) el
+\codigo{lastSeq} y el contador de secuencia. Asi, el \codigo{CATCHUP} posterior
+lleva la marca restaurada \codigo{X} en vez de \codigo{0}, y el lider solo
+transmite el delta, es decir desde \codigo{X+1} (\codigo{log.since(X)} devuelve las
+transferencias \emph{estrictamente mayores} que \codigo{X}). Un checkpoint
+ausente, ilegible o incompatible (version, \codigo{idBase} o numero de cuentas que
+no coinciden) se ignora y el arranque cae a un catch-up completo; \codigo{load()}
+nunca lanza excepcion.
+
+El mensaje que evidencia la reanudacion exacta -- el literal ``Me quede en la
+secuencia X, enviame desde X+1'' que pide la rubrica -- lo imprime
+\codigo{cluster/ReplicaSync.java} justo antes de cada \codigo{CATCHUP}, en el camino
+de revival de toda replica (con o sin checkpoint). Captura la marca una sola vez
+para que el mensaje y el \codigo{CATCHUP} coincidan:
+
+\begin{lstlisting}[language=Java,caption={ReplicaSync: imprime el punto de reanudacion antes del CATCHUP}]
+long seq = bank.lastSeq();
+System.out.println("[replica] Me quede en la secuencia " + seq
+        + ", enviame desde " + (seq + 1));
+out.write(("CATCHUP " + seq + "\n").getBytes(StandardCharsets.UTF_8));
+\end{lstlisting}
+
+Cuando ademas hay checkpoint, \codigo{ReplicaCheckpoint.load()} deja constancia de
+la marca restaurada y \codigo{app/Node.java} la confirma, de modo que la salida
+tipica al revivir es:
+
+\begin{lstlisting}[language=none,caption={Salida tipica al revivir el proceso de una replica}]
+[checkpoint] restored checkpoint/nodo-2.json at watermark 4127
+[node] replica resuming at sequence 4127
+[replica] Me quede en la secuencia 4127, enviame desde 4128
+\end{lstlisting}
+
+Con la marca \codigo{4127} sembrada, \codigo{ReplicaSync} envia
+\codigo{CATCHUP 4127} y el lider reproduce desde la \codigo{4128} en adelante: esa
+es la reanudacion exacta por secuencia. La cadencia de guardado tiene dos partes:
+un paro ordenado (el \emph{shutdown hook} en \codigo{Node.java}) escribe el estado
+exacto de la ultima transferencia aplicada -- y la demostracion en vivo apaga la VM,
+que es un paro ordenado --, mientras que un demonio periodico
+(\codigo{ReplicaCheckpoint.start()}) escribe un piso para que un \emph{crash} duro
+pierda a lo sumo un intervalo. Un \codigo{save()} cuya marca no cambio desde el
+ultimo se omite (\codigo{lastSavedWatermark}), asi que una replica ociosa no cuesta
+nada.
+
+\subsection{Por que no ``borra y descarga''}
+
+El contraste con el anti-patron es el corazon de la rubrica. ``Borrar el estado y
+bajar todo de nuevo'' significa que la replica, al revivir, descarta sus saldos y
+pide al lider la historia completa desde la secuencia \codigo{0}. Eso funciona,
+pero el costo de catch-up crece con \emph{toda} la historia del banco, no con lo
+que la replica perdio mientras estuvo caida: no escala y, segun la rubrica, baja la
+calificacion de 25 a 13 puntos.
+
+La implementacion aqui reanuda por \emph{delta exacto}. Gracias al checkpoint
+durable, la replica conoce su \codigo{watermark} al arrancar y solo pide
+\codigo{CATCHUP <watermark>}; el lider responde con \codigo{log.since(watermark)},
+que son unicamente las transferencias \codigo{watermark+1, watermark+2, ...} que
+ocurrieron durante la caida. El trabajo de recuperacion es proporcional a la
+\emph{brecha}, no al tamano total del estado. Y como \codigo{applyReplicated()}
+descarta cualquier secuencia ya aplicada y el buffer de reordenamiento garantiza
+orden contiguo, reanudar desde la marca es seguro aunque el lider reenvie un
+solapamiento: el resultado converge al estado del lider sin reprocesar la historia
+entera.

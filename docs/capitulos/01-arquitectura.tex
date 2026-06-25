@@ -1,0 +1,169 @@
+\section{Arquitectura general}
+
+\subsection{El sistema en una pagina}
+
+\textbf{Tesoreria Distribuida} (Equipo 18) es un mini banco distribuido escrito
+en Java puro, sin frameworks web ni servidor de aplicaciones. El estado que
+mantiene es un \emph{ledger} de cuentas (un libro de saldos) replicado entre
+tres nodos. Sobre ese ledger ofrece cuatro capacidades de cliente: registro de
+usuarios, \emph{login} que emite un token JWT, consulta del saldo de una cuenta y
+transferencia de dinero entre dos cuentas. A esas operaciones se suman la
+\textbf{durabilidad} de la bitacora de transferencias en Cloud Storage (GCS) y un
+\textbf{dashboard} de monitoreo del cluster.
+
+El paquete raiz es \codigo{mx.ipn.escom.tesoreria}. El build con Maven produce un
+\emph{fat jar} ejecutable (un \codigo{jar-with-dependencies} cuya clase principal
+es \codigo{app/Node.java}). Una propiedad central del diseno es que \emph{un mismo
+jar} arranca como lider o como replica segun la configuracion: el rol no se
+compila, se decide en tiempo de ejecucion leyendo variables de entorno con
+prefijo \codigo{TES\_}. En concreto, \codigo{NodeConfig.isLeader()} considera al
+proceso lider cuando \codigo{TES\_LEADER\_HOST} esta vacio o ausente, y replica
+cuando esa variable nombra el host del lider a seguir. El secreto de firma de los
+tokens (\codigo{TES\_JWT\_SECRET}) debe tener el MISMO valor en los tres nodos
+para que un JWT emitido en cualquiera sea valido en todos.
+
+Al arrancar, \codigo{Node.main} carga el dataset compartido de cuentas en un
+\codigo{core/Ledger.java} nuevo y lo envuelve en un \codigo{core/Bank.java}, que
+es quien posee la secuencia de \emph{commits} y la difusion a observadores. Si la
+carga no produce cuentas, el nodo falla de inmediato en lugar de servir con un
+ledger vacio:
+
+\begin{lstlisting}[language=Java,caption={Node.main: carga del dataset y rechazo de un ledger vacio}]
+Ledger ledger = new Ledger();
+int loaded = Dataset.loadInto(ledger, Path.of(config.datasetPath()), config.idBase());
+if (loaded <= 0) {
+    throw new IllegalStateException("dataset loaded 0 accounts from "
+            + config.datasetPath() + "; refusing to start with an empty ledger");
+}
+Bank bank = new Bank(ledger);
+\end{lstlisting}
+
+\subsection{Topologia: lider y replicas}
+
+El sistema corre en tres nodos. \textbf{nodo-1} es el \textbf{lider}
+(maquina \codigo{e2-standard-4}) y es el unico que recibe el trafico de clientes:
+sobre el se ejecutan registro, \emph{login}, consulta de saldo y, sobre todo, las
+transferencias, porque es el lider quien aplica de verdad cada movimiento, le
+asigna un numero de secuencia y lo numera de forma monotona. \textbf{nodo-2} y
+\textbf{nodo-3} son \textbf{replicas} (maquinas \codigo{e2-standard-2}) que no
+originan transacciones de cliente: solo siguen el flujo de transferencias que el
+lider ya acepto y lo reaplican localmente para converger al mismo estado.
+
+Quien es lider y quien es replica lo decide la configuracion, no el codigo.
+\codigo{app/NodeConfig.java} lee \codigo{TES\_LEADER\_HOST} desde el entorno y
+expone el rol con \codigo{isLeader()}:
+
+\begin{lstlisting}[language=Java,caption={NodeConfig.isLeader: el rol se infiere de TES\_LEADER\_HOST}]
+public boolean isLeader() {
+    return leaderHost == null || leaderHost.isBlank();
+}
+\end{lstlisting}
+
+A partir de ese rol, \codigo{Node.main} ramifica el arranque. En el \textbf{lider}
+(cuando \codigo{config.isLeader()} es verdadero) corre, si GCS esta configurado,
+la recuperacion en frio de la bitacora con \codigo{durable/Journal.java}, y
+registra dos observadores sobre el banco: el propio \codigo{Journal}, que guarda
+de forma durable cada transferencia nueva, y un \codigo{cluster/ReplicaFeed.java},
+un servidor TCP que transmite los \emph{commits} en vivo hacia las replicas
+conectadas. En la \textbf{replica} (cualquier otro caso) se restaura primero el
+\emph{checkpoint} durable con \codigo{durable/ReplicaCheckpoint.java} si hay GCS, y
+luego se arranca un \codigo{cluster/ReplicaSync.java} que se pone al dia desde el
+lider por numero de secuencia y aplica los \emph{commits} en vivo. El cliente pega
+al lider porque solo alli existe el camino que origina, valida y numera una
+transferencia; las replicas son un seguidor convergente, no un punto de entrada de
+escritura.
+
+\subsection{Mapa de paquetes}
+
+El codigo se organiza por responsabilidad bajo \codigo{mx.ipn.escom.tesoreria}:
+
+\begin{itemize}
+  \item \codigo{app} --- arranque y configuracion del proceso: \codigo{Node}
+        (el \codigo{main}), \codigo{NodeConfig} (variables \codigo{TES\_*}) y
+        \codigo{NodeStats} (metricas del nodo).
+  \item \codigo{net} --- transporte HTTP sobre NIO crudo, sin librerias:
+        \codigo{Server}, \codigo{IoLoop}, \codigo{Channel},
+        \codigo{RequestParser}, \codigo{Request}, \codigo{Reply},
+        \codigo{Routes} y la interfaz \codigo{Endpoint}.
+  \item \codigo{core} --- el dominio del banco: \codigo{Account},
+        \codigo{Ledger} (cuentas y dinero), \codigo{Bank} (orquesta la
+        transaccion y la secuencia), \codigo{Money}, \codigo{Transfer},
+        \codigo{TransferLog}, \codigo{TransferException}, \codigo{Dataset} y la
+        interfaz \codigo{CommitListener}.
+  \item \codigo{security} --- autenticacion: \codigo{Tokens} (JWT),
+        \codigo{Passwords} (bcrypt), \codigo{Credential},
+        \codigo{CredentialStore} y \codigo{Authenticator}.
+  \item \codigo{api} --- los \emph{endpoints} HTTP: \codigo{RegisterEndpoint},
+        \codigo{LoginEndpoint}, \codigo{BalanceEndpoint},
+        \codigo{TransferEndpoint}, \codigo{StatsEndpoint},
+        \codigo{PanelEndpoint} y \codigo{DashboardEndpoint}.
+  \item \codigo{cluster} --- replicacion TCP (una linea JSON por transferencia):
+        \codigo{ReplicaFeed} en el lider, \codigo{ReplicaSync} en la replica y
+        \codigo{WireCodec} para codificar el cable.
+  \item \codigo{durable} --- durabilidad en GCS por REST: \codigo{Journal},
+        \codigo{GcsStore}, \codigo{GcsAuth} y \codigo{ReplicaCheckpoint}.
+  \item \codigo{loadtest} --- \codigo{LoadDriver}, generador de carga y
+        verificador de la invariante de conservacion del dinero.
+\end{itemize}
+
+\subsection{Flujo de una transferencia de punta a punta}
+
+Una transferencia recorre todas las capas en orden. Tomando como ejemplo
+\codigo{POST /api/transactions/transfer} sobre el lider:
+
+\begin{enumerate}
+  \item \textbf{Cliente $\rightarrow$ red.} La peticion llega al servidor NIO
+        \codigo{net/Server.java}. El hilo aceptador la reparte por
+        \emph{round-robin} a un reactor (\codigo{net/IoLoop.java}); los reactores
+        hacen la E/S y un pool de \emph{workers} computa la respuesta.
+  \item \textbf{Ruteo.} \codigo{net/Routes.java} empareja metodo y ruta y
+        despacha al \emph{endpoint} registrado en \codigo{Node.main} para
+        \codigo{POST /api/transactions/transfer}: una instancia de
+        \codigo{api/TransferEndpoint.java}.
+  \item \textbf{Validacion JWT.} El \emph{endpoint} primero exige
+        \codigo{POST} (devuelve 405 en otro caso) y luego autoriza el token con
+        \codigo{security/Authenticator.java}; sin token valido responde 401.
+  \item \textbf{Parseo y conversion a centavos.} Lee del cuerpo JSON las claves
+        obligatorias \codigo{sourceAccountId}, \codigo{targetAccountId} (ids como
+        cadenas) y \codigo{amount} (decimal), convirtiendo el monto a centavos
+        con \codigo{core/Money.java}. Un cuerpo malformado da 400
+        \codigo{bad\_request}; un id numerico fuera del rango \codigo{int} da 404
+        \codigo{no\_such\_account}.
+  \item \textbf{Banco y ledger.} Entrega el movimiento a
+        \codigo{Bank.transfer(from, to, cents)}, que rechaza por politica la
+        auto-transferencia y el monto no positivo, delega el debito/credito atomico
+        al \codigo{core/Ledger.java}, y solo si tiene exito estampa el numero de
+        secuencia, lo registra en el \codigo{core/TransferLog.java} y avanza los
+        contadores.
+  \item \textbf{Difusion a observadores.} En el mismo \codigo{transfer}, el banco
+        notifica a cada \codigo{CommitListener} registrado: el
+        \codigo{durable/Journal.java}, que persiste la transferencia en la
+        bitacora GCS, y el \codigo{cluster/ReplicaFeed.java}, que la empuja a las
+        replicas conectadas.
+  \item \textbf{Feed a replicas.} Cada replica recibe el \emph{commit} por su
+        \codigo{cluster/ReplicaSync.java} y lo reaplica con
+        \codigo{Bank.applyReplicated}, que es idempotente por secuencia para no
+        duplicar saldos tras una reconexion.
+  \item \textbf{Respuesta.} El \emph{endpoint} devuelve 200 con
+        \codigo{\{"status":"ok","seq":<seq>\}}; un rechazo del banco
+        (\codigo{TransferException}) se mapea a 404 para \codigo{no\_such\_account}
+        y a 400 para los demas codigos, con cuerpo \codigo{\{"error":<code>\}}.
+\end{enumerate}
+
+El nucleo del paso 5, ya en \codigo{api/TransferEndpoint.java}, entrega el
+movimiento al banco y traduce el resultado a una respuesta REST:
+
+\begin{lstlisting}[language=Java,caption={TransferEndpoint.serve: del banco a la respuesta HTTP}]
+try {
+    long seq = bank.transfer(from, to, cents);
+    JsonObject ok = new JsonObject();
+    ok.addProperty("status", "ok");
+    ok.addProperty("seq", Long.valueOf(seq));
+    return Reply.json(200, gson.toJson(ok));
+} catch (TransferException e) {
+    int status = "no_such_account".equals(e.code()) ? 404 : 400;
+    JsonObject err = new JsonObject();
+    err.addProperty("error", e.code());
+    return Reply.json(status, gson.toJson(err));
+}
+\end{lstlisting}
