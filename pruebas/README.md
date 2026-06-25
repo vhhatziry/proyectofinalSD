@@ -9,9 +9,10 @@ Util para ensayar antes de la revision en vivo.
 bash pruebas/correr-todo.sh
 ```
 
-Compila, y corre: tests unitarios, consistencia de replicacion, cluster local y
-hardening de endpoints. La de recuperacion en frio de GCS solo corre si defines
-`TES_BUCKET` y `TES_GCS_KEYFILE`.
+Compila, y corre: tests unitarios, consistencia de replicacion, convergencia ante
+inversion de secuencia, cluster local y hardening de endpoints. Las de GCS
+(recuperacion en frio y checkpoint de replica) solo corren si defines `TES_BUCKET`
+y `TES_GCS_KEYFILE`.
 
 ## Pruebas individuales
 

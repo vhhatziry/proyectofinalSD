@@ -41,8 +41,10 @@ hatziry/
       resources/    dashboard.html y demas recursos estaticos
     test/
       java/mx/ipn/escom/tesoreria/tests/
-                    Assert, RunTests + suites skeleton (Ledger, Money,
-                    RequestParser, WireCodec)  -- harness Java puro, sin JUnit
+                    Assert, RunTests + suites (Ledger, Money, RequestParser,
+                    WireCodec, Auth, Replay, Checkpoint, JwtCrossNode, Catchup)
+                    -- harness Java puro, sin JUnit; ReplConsistency y
+                    ReplInversion son pruebas de socket aparte
   material-profesor/                        archivos del profesor (ver abajo)
   deploy/                                   scripts/notas de despliegue de los nodos
 ```
@@ -106,7 +108,8 @@ java -jar target/tesoreria-distribuida-jar-with-dependencies.jar 8080
 
 Variables `TES_*` principales: `TES_DATASET`, `TES_JWT_SECRET`, `TES_NODE_ID`,
 `TES_PEERS`, `TES_LEADER_HOST`, `TES_REPL_PORT` (default `9090`), `TES_BUCKET`,
-`TES_GCS_KEYFILE`, `TES_WORKERS`.
+`TES_GCS_KEYFILE`, `TES_WORKERS`, `TES_REACTORS` (numero de reactores NIO; default
+= numero de CPUs, que es el optimo).
 
 ## Documentacion relacionada
 

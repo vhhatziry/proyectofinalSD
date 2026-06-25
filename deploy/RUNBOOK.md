@@ -64,9 +64,10 @@ curl -s http://$L:8080/api/stats | jq '{role,status,lastTxId}'   # el lider SOLO
 $GC compute instances start nodo-2 --zone=$ZONE     # revive
 # en su log se ve que reanuda desde su secuencia EXACTA (no desde 0):
 $GC compute ssh nodo-2 --zone=$ZONE --tunnel-through-iap \
-   --command='sudo journalctl -u node.service | grep -E "checkpoint|resuming" | tail -2'
+   --command='sudo journalctl -u node.service | grep -E "checkpoint|resuming|Me quede" | tail -3'
 #   -> [checkpoint] restored checkpoint/nodo-2.json at watermark <N>
 #   -> [node] replica resuming at sequence <N>
+#   -> [replica] Me quede en la secuencia <N>, enviame desde <N+1>   (texto LITERAL de la rubrica)
 # y converge al lider (mismo lastTxId, mismo totalBalance):
 N2=$($GC compute instances describe nodo-2 --zone=$ZONE --format='get(networkInterfaces[0].accessConfigs[0].natIP)')
 curl -s http://$N2:8080/api/stats | jq '{nodeId,lastTxId,totalBalance}'
@@ -76,7 +77,8 @@ curl -s http://$N2:8080/api/stats | jq '{nodeId,lastTxId,totalBalance}'
 
 `http://34.67.240.245:8080/` muestra, por nodo: estado, #cuentas, saldo total,
 #transferencias, ultima tx, %CPU/%RAM/%Disco, y el conteo de tx en Cloud Storage.
-Se auto-actualiza (reactivo, +1.5 pts).
+Se auto-actualiza solo: el toggle "En vivo" arranca **encendido por defecto**, asi
+que el tablero refresca sin pulsar "Refrescar" (el extra reactivo).
 
 ## 6. Generador de carga (80/20, 1 min, 3 escenarios)
 
