@@ -38,6 +38,8 @@ public final class RunTests {
         cases.addAll(new AuthTest().cases());
         cases.addAll(new ReplayTest().cases());
         cases.addAll(new CheckpointTest().cases());
+        cases.addAll(new JwtCrossNodeTest().cases());
+        cases.addAll(new CatchupTest().cases());
 
         int passed = 0;
         int failed = 0;

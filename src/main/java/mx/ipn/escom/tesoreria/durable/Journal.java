@@ -69,8 +69,26 @@ public final class Journal implements CommitListener {
      */
     public int recover(CommitListener apply) throws IOException, InterruptedException {
         List<Transfer> all = store.readAll();
+        // The leader numbers transfers 1,2,3,... and the journal is never truncated,
+        // so a fully durable log is contiguous from 1. readAll() returns it
+        // seq-sorted, so a seq that is not the expected successor means a batch never
+        // reached Cloud Storage (drainLoop drops a batch whose upload throws). Warn
+        // loudly rather than recover a silently incomplete log; recovery still
+        // proceeds so the leader can serve, but the gap is on the record.
+        long expected = 1L;
+        int gaps = 0;
         for (Transfer t : all) {
+            if (t.seq() != expected) {
+                System.err.println("journal: recovery gap before seq " + t.seq()
+                        + " (expected " + expected + "); a batch was not durably stored");
+                gaps++;
+            }
             apply.onCommit(t);
+            expected = t.seq() + 1L;
+        }
+        if (gaps > 0) {
+            System.err.println("journal: recovery completed with " + gaps
+                    + " gap(s); some committed transfers were not recovered");
         }
         return all.size();
     }
