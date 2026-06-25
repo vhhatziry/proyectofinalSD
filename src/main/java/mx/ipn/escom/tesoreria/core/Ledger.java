@@ -1,6 +1,7 @@
 package mx.ipn.escom.tesoreria.core;
 
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.LongSupplier;
 
 /**
  * Holds the set of accounts and performs the raw mechanics of moving money
@@ -66,7 +67,28 @@ public final class Ledger {
      *     unknown, or {@code low_balance} if the source cannot cover the amount
      */
     public void move(int from, int to, long cents) throws TransferException {
-        apply(from, to, cents, true);
+        apply(from, to, cents, true, null);
+    }
+
+    /**
+     * Same debit and credit as {@link #move(int, int, long)}, but assigns the
+     * transfer's sequence number by invoking {@code sequencer} WHILE both account
+     * monitors are held, and returns it. Stamping the sequence inside the lock makes
+     * the sequence order match the money-movement order for any shared account, so a
+     * follower replaying in sequence order never observes a balance go transiently
+     * negative: the credit that funds a later debit always carries the lower
+     * sequence. {@code sequencer} must be cheap and lock free (an {@code AtomicLong}
+     * increment); doing real work inside it would extend the critical section.
+     *
+     * @param sequencer supplies the committed transfer's sequence number; invoked
+     *     exactly once, inside the lock, only on success
+     * @return the sequence number produced by {@code sequencer}
+     * @throws TransferException with code {@code no_such_account} if either id is
+     *     unknown, or {@code low_balance} if the source cannot cover the amount
+     */
+    public long move(int from, int to, long cents, LongSupplier sequencer)
+            throws TransferException {
+        return apply(from, to, cents, true, sequencer);
     }
 
     /**
@@ -74,35 +96,44 @@ public final class Ledger {
      * credits without re-checking the source balance. Used on the follower and
      * cold-recovery paths, which replay transfers the leader already accepted.
      *
-     * <p>Re-gating a replayed transfer on funds would be a bug. The leader stamps
-     * a transfer's sequence number after moving the money, and not atomically
-     * with it, so two concurrent transfers can be sequenced in the opposite order
-     * to the order in which they actually moved money. A follower that replays in
-     * sequence order and re-checks funds would then reject a transfer the leader
-     * had authorised, drop it, and diverge from the leader on those accounts
-     * permanently (the global total stays conserved, which hides it). Applying the
-     * debit and credit unconditionally is order independent, so the follower
-     * always converges to the leader's per-account balances. A balance may go
-     * transiently negative mid-catch-up, which is cosmetic on a follower and
-     * resolves once it is fully caught up.
+     * <p>Re-gating a replayed transfer on funds would be a bug. {@link #move} can
+     * reject on {@code low_balance}; on the follower path that rejection is caught
+     * and the transfer is dropped, yet the commit counters still advance, so the
+     * money never moves while the watermark passes it and the follower diverges from
+     * the leader on those accounts permanently (the global total stays conserved,
+     * which hides it). That bites whenever the follower's state differs from the
+     * leader's at apply time, for example a reconnect overlap or a checkpoint-restored
+     * intermediate state. Applying the debit and credit unconditionally never drops
+     * and is order independent, so the follower always converges to the leader's
+     * per-account balances.
+     *
+     * <p>The leader now stamps a transfer's sequence number inside the same lock that
+     * moves the money (see {@link #move(int, int, long, java.util.function.LongSupplier)}),
+     * so sequence order matches money-movement order and a follower replaying in
+     * sequence order no longer goes transiently negative; {@code settle} is kept
+     * regardless, as the convergence guarantee above.
      *
      * @throws TransferException with code {@code no_such_account} if either id is
      *     unknown
      */
     public void settle(int from, int to, long cents) throws TransferException {
-        apply(from, to, cents, false);
+        apply(from, to, cents, false, null);
     }
 
     /**
      * Shared movement mechanics behind {@link #move} and {@link #settle}: looks up
-     * both accounts, takes their monitors lowest id first, optionally enforces
-     * that the source can cover the amount, then performs the debit and matching
-     * credit as one atomic step.
+     * both accounts, takes their monitors lowest id first, optionally enforces that
+     * the source can cover the amount, performs the debit and matching credit as one
+     * atomic step, and (when a {@code sequencer} is supplied) assigns the sequence
+     * number inside that same step so commit order matches money-movement order.
      *
      * @param enforceFunds when true, reject with {@code low_balance} if the source
      *     cannot cover {@code cents}; when false, apply unconditionally
+     * @param sequencer when non-null, invoked once inside the lock on success to
+     *     produce the sequence number; when null, nothing is stamped and 0 is returned
+     * @return the sequence number from {@code sequencer}, or 0 when none was supplied
      */
-    private void apply(int from, int to, long cents, boolean enforceFunds)
+    private long apply(int from, int to, long cents, boolean enforceFunds, LongSupplier sequencer)
             throws TransferException {
         Account src = accounts.get(from);
         if (src == null) {
@@ -124,6 +155,9 @@ public final class Ledger {
                 }
                 src.setBalanceCents(src.balanceCents() - cents);
                 dst.setBalanceCents(dst.balanceCents() + cents);
+                // Stamp the sequence inside the lock (when one was requested) so the
+                // commit order matches the money-movement order; see the move overload.
+                return (sequencer != null) ? sequencer.getAsLong() : 0L;
             }
         }
     }

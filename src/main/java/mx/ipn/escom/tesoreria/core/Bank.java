@@ -13,9 +13,9 @@ import java.util.concurrent.atomic.AtomicLong;
  *
  * <p>There are two ways a transfer enters the bank. {@link #transfer} is the
  * client-facing path on the leader: it screens out the operations that are
- * never valid as policy, asks the ledger to perform the movement, and only on
- * success stamps a fresh sequence number, records the entry, and fans it out to
- * listeners. {@link #applyReplicated} is the follower path: it replays a
+ * never valid as policy, then asks the ledger to perform the movement and stamp
+ * the next sequence number atomically with it, records the entry, and fans it
+ * out to listeners. {@link #applyReplicated} is the follower path: it replays a
  * transfer that the leader already accepted, so the sequence number arrives with
  * the entry instead of being generated here.
  *
@@ -40,9 +40,9 @@ public final class Bank {
      * Performs a client-requested transfer and, when it succeeds, commits it.
      * The amount and the source/destination distinction are checked here because
      * they are bank policy rather than ledger mechanics; the actual debit and
-     * credit are delegated to the ledger. A committed transfer receives the next
-     * sequence number, is appended to the log, advances the applied counters,
-     * and is delivered to every listener.
+     * credit, and atomically with them the next sequence number, are delegated to
+     * the ledger. The committed transfer is then appended to the log, advances the
+     * applied counters, and is delivered to every listener.
      *
      * @return the sequence number assigned to the committed transfer
      * @throws TransferException for a self transfer, a non-positive amount, an
@@ -56,8 +56,10 @@ public final class Bank {
             throw TransferException.badAmount();
         }
 
-        ledger.move(from, to, cents);
-        long seq = sequence.incrementAndGet();
+        // Move the money and assign the sequence number atomically: the sequencer
+        // runs inside the ledger's per-account lock, so sequence order matches the
+        // money-movement order and a follower never observes a transient negative.
+        long seq = ledger.move(from, to, cents, sequence::incrementAndGet);
         Transfer committed = new Transfer(seq, from, to, cents);
         log.append(committed);
         applied.incrementAndGet();
@@ -79,14 +81,18 @@ public final class Bank {
      * reconnect never double-applies and corrupts balances. A fresh transfer is
      * <b>settled</b> (force-applied) against the local ledger rather than moved:
      * it is a transfer the leader already authorised, so it must not be re-gated
-     * on funds. The leader assigns sequence numbers after moving money and not
-     * atomically with it, so two concurrent transfers can be sequenced opposite to
-     * the order they moved; a follower that re-checked funds in sequence order
-     * could reject an authorised transfer and diverge from the leader on those
-     * accounts forever. {@link Ledger#settle} applies the debit/credit
-     * unconditionally, which is order independent and therefore convergent (a
-     * missing account is still tolerated, since a follower may not have
-     * materialized every account). The entry is recorded in the log so it mirrors
+     * on funds: re-gating with {@link Ledger#move} could reject it on
+     * {@code low_balance}, and that rejection would be caught and the transfer
+     * dropped while the counters still advance, so the money would never move and
+     * the follower would diverge from the leader on those accounts permanently. That
+     * bites whenever the follower's state differs from the leader's at apply time (a
+     * reconnect overlap, a checkpoint-restored intermediate state). {@link
+     * Ledger#settle} applies the debit/credit unconditionally and never drops, which
+     * is order independent and therefore convergent (a missing account is still
+     * tolerated, since a follower may not have materialized every account). The
+     * leader now stamps the sequence inside the move's lock, so sequence order
+     * matches money-movement order and a follower replaying in order no longer goes
+     * transiently negative. The entry is recorded in the log so it mirrors
      * the leader, and counted. Both the applied watermark ({@code lastSeq}) and the
      * sequence counter are then raised to this entry's sequence: raising
      * {@code sequence} is what lets the leader resume numbering after cold recovery
